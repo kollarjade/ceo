@@ -1,0 +1,96 @@
+# EFLA Trainer Configuration for 1T Parameter Model
+# Target: 8x NVIDIA B200 (SM100), 50M token context
+
+model:
+  name: efla-1t
+  vocab_size: 131072
+  hidden_dim: 16384
+  num_layers: 80
+  num_heads: 128
+  num_kv_heads: 16
+  head_dim: 128
+  intermediate_dim: 65536
+  max_seq_len: 50000000
+  norm_type: rmsnorm
+  activation: gelu
+  tie_embeddings: false
+  dropout: 0.0
+  dtype: bf16
+  target_params: 1000000000000
+
+  efla:
+    enabled: true
+    num_heads: 128
+    state_dim: 128
+    chunk_size: 4096
+    learned_beta: true
+    initial_beta: 1.0
+    beta_schedule: constant
+    use_chunked_scan: true
+
+  prism:
+    enabled: true
+    num_iterations: 3
+    shortconv_window: 64
+    use_proxy: true
+    forget_factor: 0.99
+
+training:
+  total_steps: 1000000
+  warmup_steps: 2000
+  micro_batch_size: 1
+  global_batch_size: 512
+  gradient_accumulation_steps: 64
+  learning_rate: 1.0e-4
+  min_learning_rate: 1.0e-5
+  weight_decay: 0.1
+  gradient_clip: 1.0
+  label_smoothing: 0.0
+  optimizer: lion_muon
+  lion_beta1: 0.95
+  lion_beta2: 0.98
+  muon_momentum: 0.95
+  muon_iterations: 5
+  lr_schedule: linear_warmup_cosine
+  mixed_precision: true
+  fp8_training: true
+  loss_scale: 65536.0
+  dynamic_loss_scale: true
+
+runtime:
+  world_size: 8
+  rank: 0
+  tensor_parallel_size: 8
+  pipeline_parallel_size: 1
+  zero_stage: 2
+  cpu_offload: false
+  nvme_offload: false
+  nvme_path: /tmp/offload
+  seed: 42
+  deterministic: true
+
+data:
+  path: data/train.bin
+  tokenizer_path: tokenizer.bin
+  seq_len: 8192
+  shuffle_buffer_size: 10000
+  prefetch_factor: 2
+  num_workers: 4
+  pack_sequences: true
+
+checkpoint:
+  dir: checkpoints
+  save_interval: 1000
+  keep_last_n: 5
+  save_optimizer: true
+  compression: true
+  async_save: true
+
+telemetry:
+  log_level: info
+  log_file: training.log
+  metrics_interval: 10
+  enable_prometheus: false
+  prometheus_port: 9090
+  track_memory: true
+  track_throughput: true

@@ -1,0 +1,294 @@
+const std = @import("std");
+const config_mod = @import("../util/config.zig");
+
+pub const TelemetryConfig = config_mod.TelemetryConfig;
+
+/// Metrics for a training step
+pub const StepMetrics = struct {
+    step: usize,
+    tokens: usize,
+    loss: f32,
+    lr: f32,
+    grad_norm: f32,
+    throughput: f64,
+    memory_used: usize,
+    memory_total: usize,
+    timestamp: i64,
+};
+
+/// Telemetry system for logging and metrics
+pub const Telemetry = struct {
+    config: TelemetryConfig,
+    rank: usize,
+    log_file: ?std.fs.File,
+    jsonl_file: ?std.fs.File,
+    metrics_buffer: std.ArrayList(StepMetrics),
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        config: TelemetryConfig,
+        rank: usize,
+    ) !Self {
+        var log_file: ?std.fs.File = null;
+        var jsonl_file: ?std.fs.File = null;
+
+        if (rank == 0) {
+            log_file = std.fs.cwd().createFile(config.log_file, .{ .truncate = false }) catch null;
+            if (log_file) |f| {
+                try f.seekFromEnd(0);
+            }
+
+            const jsonl_path = try std.fmt.allocPrint(allocator, "{s}.jsonl", .{config.log_file});
+            defer allocator.free(jsonl_path);
+            jsonl_file = std.fs.cwd().createFile(jsonl_path, .{ .truncate = false }) catch null;
+            if (jsonl_file) |f| {
+                try f.seekFromEnd(0);
+            }
+        }
+
+        return .{
+            .config = config,
+            .rank = rank,
+            .log_file = log_file,
+            .jsonl_file = jsonl_file,
+            .metrics_buffer = std.ArrayList(StepMetrics).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.log_file) |f| f.close();
+        if (self.jsonl_file) |f| f.close();
+        self.metrics_buffer.deinit();
+    }
+
+    /// Log a training step
+    pub fn logStep(self: *Self, metrics: StepMetrics) !void {
+        if (self.rank != 0) return;
+
+        try self.metrics_buffer.append(metrics);
+
+        // Write to JSONL
+        if (self.jsonl_file) |f| {
+            var buf_writer = std.io.bufferedWriter(f.writer());
+            var writer = buf_writer.writer();
+
+            try writer.print(
+                "{{\"step\":{d},\"tokens\":{d},\"lr\":{d:.6e},\"grad_norm\":{d:.4e},\"timestamp\":{d}}}\n",
+                .{ metrics.step, metrics.tokens, metrics.lr, metrics.grad_norm, metrics.timestamp },
+            );
+
+            try buf_writer.flush();
+        }
+    }
+
+    /// Log metrics
+    pub fn logMetrics(self: *Self, metrics: StepMetrics) !void {
+        if (self.rank != 0) return;
+
+        if (self.log_file) |f| {
+            var buf_writer = std.io.bufferedWriter(f.writer());
+            var writer = buf_writer.writer();
+
+            try writer.print(
+                "[{d}] step={d} loss={d:.4f} lr={d:.2e} tokens={d} throughput={d:.1f}\n",
+                .{
+                    std.time.timestamp(),
+                    metrics.step,
+                    metrics.loss,
+                    metrics.lr,
+                    metrics.tokens,
+                    metrics.throughput,
+                },
+            );
+
+            try buf_writer.flush();
+        }
+    }
+
+    /// Log health check
+    pub fn logHealthCheck(self: *Self, status: HealthStatus) !void {
+        if (self.rank != 0) return;
+
+        std.log.info("Health check: {}", .{status});
+    }
+
+    /// Export metrics for Prometheus
+    pub fn exportPrometheus(self: *Self, writer: anytype) !void {
+        _ = self;
+
+        try writer.writeAll("# HELP efla_training_step Current training step\n");
+        try writer.writeAll("# TYPE efla_training_step gauge\n");
+        try writer.writeAll("efla_training_step 0\n");
+
+        try writer.writeAll("# HELP efla_training_loss Current training loss\n");
+        try writer.writeAll("# TYPE efla_training_loss gauge\n");
+        try writer.writeAll("efla_training_loss 0\n");
+
+        try writer.writeAll("# HELP efla_training_throughput Tokens per second\n");
+        try writer.writeAll("# TYPE efla_training_throughput gauge\n");
+        try writer.writeAll("efla_training_throughput 0\n");
+    }
+};
+
+/// Health check status
+pub const HealthStatus = struct {
+    gpu_healthy: bool,
+    memory_healthy: bool,
+    no_nan_inf: bool,
+    temperature_ok: bool,
+
+    pub fn isHealthy(self: HealthStatus) bool {
+        return self.gpu_healthy and self.memory_healthy and
+            self.no_nan_inf and self.temperature_ok;
+    }
+
+    pub fn format(
+        self: HealthStatus,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print(
+            "HealthStatus{{ gpu={}, memory={}, nan_inf={}, temp={} }}",
+            .{
+                self.gpu_healthy,
+                self.memory_healthy,
+                self.no_nan_inf,
+                self.temperature_ok,
+            },
+        );
+    }
+};
+
+/// Check for NaN/Inf in tensor
+pub fn checkNaNInf(ptr: [*]const f32, len: usize) bool {
+    for (0..len) |i| {
+        if (std.math.isNan(ptr[i]) or std.math.isInf(ptr[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Custom log function
+pub fn logFn(
+    comptime message_level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const level_txt = switch (message_level) {
+        .err => "ERROR",
+        .warn => "WARN",
+        .info => "INFO",
+        .debug => "DEBUG",
+    };
+
+    const scope_txt = if (scope == .default) "" else @tagName(scope);
+
+    const stdout = std.io.getStdErr().writer();
+
+    const timestamp = std.time.timestamp();
+
+    stdout.print("[{d}] [{s}] {s}: " ++ format ++ "\n", .{
+        timestamp,
+        level_txt,
+        scope_txt,
+    } ++ args) catch {};
+}
+
+/// Memory statistics
+pub const MemoryStats = struct {
+    allocated: usize,
+    freed: usize,
+    current: usize,
+    peak: usize,
+
+    pub fn init() MemoryStats {
+        return .{
+            .allocated = 0,
+            .freed = 0,
+            .current = 0,
+            .peak = 0,
+        };
+    }
+
+    pub fn allocate(self: *MemoryStats, size: usize) void {
+        self.allocated += size;
+        self.current += size;
+        if (self.current > self.peak) {
+            self.peak = self.current;
+        }
+    }
+
+    pub fn free(self: *MemoryStats, size: usize) void {
+        self.freed += size;
+        self.current -= size;
+    }
+};
+
+/// Training statistics tracker
+pub const TrainingStats = struct {
+    total_steps: usize,
+    total_tokens: usize,
+    total_time_us: usize,
+    losses: std.ArrayList(f32),
+    learning_rates: std.ArrayList(f32),
+    grad_norms: std.ArrayList(f32),
+    start_time: i64,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) TrainingStats {
+        return .{
+            .total_steps = 0,
+            .total_tokens = 0,
+            .total_time_us = 0,
+            .losses = std.ArrayList(f32).init(allocator),
+            .learning_rates = std.ArrayList(f32).init(allocator),
+            .grad_norms = std.ArrayList(f32).init(allocator),
+            .start_time = std.time.timestamp(),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *TrainingStats) void {
+        self.losses.deinit();
+        self.learning_rates.deinit();
+        self.grad_norms.deinit();
+    }
+
+    pub fn record(self: *TrainingStats, loss: f32, lr: f32, grad_norm: f32) !void {
+        self.total_steps += 1;
+        try self.losses.append(loss);
+        try self.learning_rates.append(lr);
+        try self.grad_norms.append(grad_norm);
+    }
+
+    pub fn avgLoss(self: *TrainingStats, window: usize) f32 {
+        if (self.losses.items.len == 0) return 0.0;
+
+        const start = if (self.losses.items.len > window)
+            self.losses.items.len - window
+        else
+            0;
+
+        var sum: f32 = 0.0;
+        for (self.losses.items[start..]) |l| {
+            sum += l;
+        }
+
+        return sum / @as(f32, @floatFromInt(self.losses.items.len - start));
+    }
+
+    pub fn throughput(self: *TrainingStats) f64 {
+        const elapsed = std.time.timestamp() - self.start_time;
+        if (elapsed == 0) return 0.0;
+        return @as(f64, @floatFromInt(self.total_tokens)) / @as(f64, @floatFromInt(elapsed));
+    }
+};

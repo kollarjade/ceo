@@ -1,0 +1,96 @@
+# Smoke Test Configuration
+# Minimal configuration for testing on 1 GPU
+
+model:
+  name: efla-smoke
+  vocab_size: 8192
+  hidden_dim: 256
+  num_layers: 2
+  num_heads: 4
+  num_kv_heads: 4
+  head_dim: 64
+  intermediate_dim: 512
+  max_seq_len: 1024
+  norm_type: rmsnorm
+  activation: gelu
+  tie_embeddings: true
+  dropout: 0.0
+  dtype: bf16
+  target_params: 1000000
+
+  efla:
+    enabled: true
+    num_heads: 4
+    state_dim: 64
+    chunk_size: 128
+    learned_beta: true
+    initial_beta: 1.0
+    beta_schedule: constant
+    use_chunked_scan: true
+
+  prism:
+    enabled: true
+    num_iterations: 2
+    shortconv_window: 16
+    use_proxy: true
+    forget_factor: 0.99
+
+training:
+  total_steps: 10
+  warmup_steps: 2
+  micro_batch_size: 1
+  global_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  min_learning_rate: 1.0e-5
+  weight_decay: 0.1
+  gradient_clip: 1.0
+  label_smoothing: 0.0
+  optimizer: lion_muon
+  lion_beta1: 0.95
+  lion_beta2: 0.98
+  muon_momentum: 0.95
+  muon_iterations: 3
+  lr_schedule: constant
+  mixed_precision: true
+  fp8_training: false
+  loss_scale: 1024.0
+  dynamic_loss_scale: true
+
+runtime:
+  world_size: 1
+  rank: 0
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  zero_stage: 0
+  cpu_offload: false
+  nvme_offload: false
+  nvme_path: /tmp/offload
+  seed: 42
+  deterministic: true
+
+data:
+  path: data/smoke.bin
+  tokenizer_path: tokenizer.bin
+  seq_len: 128
+  shuffle_buffer_size: 100
+  prefetch_factor: 1
+  num_workers: 1
+  pack_sequences: true
+
+checkpoint:
+  dir: /tmp/smoke-checkpoints
+  save_interval: 5
+  keep_last_n: 2
+  save_optimizer: true
+  compression: false
+  async_save: false
+
+telemetry:
+  log_level: debug
+  log_file: smoke.log
+  metrics_interval: 1
+  enable_prometheus: false
+  prometheus_port: 9090
+  track_memory: true
+  track_throughput: true
