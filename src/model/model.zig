@@ -11,29 +11,45 @@ pub const Shape = tensor_mod.Shape;
 pub const DType = dtype_mod.DType;
 pub const BF16 = dtype_mod.BF16;
 
-/// Transformer block combining EFLA and PRISM
+pub const ModelError = error{
+    InvalidConfiguration,
+    ShapeMismatch,
+    DTypeMismatch,
+    DeviceMismatch,
+    UnsupportedDevice,
+    InvalidInputRank,
+    UnsupportedOperation,
+};
+
+pub const TransformerBlockForwardResult = struct {
+    output: *Tensor,
+    new_efla_state: ?*efla_mod.EflaState,
+    new_prism_state: ?*prism_mod.PrismState,
+};
+
+pub const ModelForwardResult = struct {
+    logits: *Tensor,
+    efla_states: []?*efla_mod.EflaState,
+    prism_states: []?*prism_mod.PrismState,
+
+    pub fn deinit(self: *ModelForwardResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.efla_states);
+        allocator.free(self.prism_states);
+        self.logits.deinit();
+    }
+};
+
 pub const TransformerBlock = struct {
-    /// Pre-attention norm
     ln1: *nn_mod.RMSNorm,
-    /// EFLA layer
     efla: *efla_mod.EflaLayer,
-    /// PRISM layer
     prism: *prism_mod.PrismLayer,
-    /// Pre-FFN norm
     ln2: *nn_mod.RMSNorm,
-    /// MLP up projection
     mlp_up: *nn_mod.Linear,
-    /// MLP down projection
     mlp_down: *nn_mod.Linear,
-    /// Activation function
     activation: nn_mod.GELU,
-    /// Configuration
     config: config_mod.ModelConfig,
-    /// Allocator
     allocator: std.mem.Allocator,
-    /// Device
     device: tensor_mod.Device,
-    /// Device ID
     device_id: i32,
 
     const Self = @This();
@@ -45,19 +61,23 @@ pub const TransformerBlock = struct {
         device_id: i32,
         rng: *std.Random,
     ) !*Self {
+        if (config.hidden_dim == 0 or config.intermediate_dim == 0 or config.num_heads == 0 or config.head_dim == 0) {
+            return ModelError.InvalidConfiguration;
+        }
+        if (config.hidden_dim % config.num_heads != 0) {
+            return ModelError.InvalidConfiguration;
+        }
+
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
-        const hidden_dim = config.hidden_dim;
-        const intermediate_dim = config.intermediate_dim;
-
-        var ln1 = try nn_mod.RMSNorm.init(allocator, hidden_dim, device, device_id);
+        const ln1 = try nn_mod.RMSNorm.init(allocator, config.hidden_dim, device, device_id);
         errdefer ln1.deinit();
 
-        var efla = try efla_mod.EflaLayer.init(
+        const efla = try efla_mod.EflaLayer.init(
             allocator,
             config.efla,
-            hidden_dim,
+            config.hidden_dim,
             config.num_heads,
             config.head_dim,
             device,
@@ -66,10 +86,10 @@ pub const TransformerBlock = struct {
         );
         errdefer efla.deinit();
 
-        var prism = try prism_mod.PrismLayer.init(
+        const prism = try prism_mod.PrismLayer.init(
             allocator,
             config.prism,
-            hidden_dim,
+            config.hidden_dim,
             config.head_dim,
             device,
             device_id,
@@ -77,13 +97,13 @@ pub const TransformerBlock = struct {
         );
         errdefer prism.deinit();
 
-        var ln2 = try nn_mod.RMSNorm.init(allocator, hidden_dim, device, device_id);
+        const ln2 = try nn_mod.RMSNorm.init(allocator, config.hidden_dim, device, device_id);
         errdefer ln2.deinit();
 
-        var mlp_up = try nn_mod.Linear.init(
+        const mlp_up = try nn_mod.Linear.init(
             allocator,
-            hidden_dim,
-            intermediate_dim,
+            config.hidden_dim,
+            config.intermediate_dim,
             false,
             device,
             device_id,
@@ -91,10 +111,10 @@ pub const TransformerBlock = struct {
         );
         errdefer mlp_up.deinit();
 
-        var mlp_down = try nn_mod.Linear.init(
+        const mlp_down = try nn_mod.Linear.init(
             allocator,
-            intermediate_dim,
-            hidden_dim,
+            config.intermediate_dim,
+            config.hidden_dim,
             false,
             device,
             device_id,
@@ -129,47 +149,51 @@ pub const TransformerBlock = struct {
         self.allocator.destroy(self);
     }
 
-    /// Forward pass through block
     pub fn forward(
         self: *Self,
         input: *Tensor,
         efla_state: ?*efla_mod.EflaState,
         prism_state: ?*prism_mod.PrismState,
-    ) !struct { output: *Tensor, new_efla_state: *efla_mod.EflaState, new_prism_state: *prism_mod.PrismState } {
-        // Pre-norm for attention
-        var normed = try self.ln1.forward(input);
+    ) !TransformerBlockForwardResult {
+        try self.validateTensorForBlock(input);
+
+        const normed = try self.ln1.forward(input);
         defer normed.deinit();
 
-        // EFLA forward
         var efla_result = try self.efla.forward(normed, efla_state);
+        errdefer {
+            efla_result.output.deinit();
+            if (efla_result.new_state) |state| {
+                state.deinit();
+            }
+        }
         defer efla_result.output.deinit();
 
-        // PRISM forward
         var prism_result = try self.prism.forward(normed, efla_result.output, prism_state);
-        defer {
-            // Don't deinit prism_result.output if we're using it
+        errdefer {
+            prism_result.output.deinit();
+            if (prism_result.new_state) |state| {
+                state.deinit();
+            }
         }
 
-        // Residual connection
-        var residual = try self.addTensors(input, prism_result.output);
+        const residual = try self.addTensors(input, prism_result.output);
         errdefer residual.deinit();
+        prism_result.output.deinit();
 
-        // Pre-norm for MLP
-        var normed2 = try self.ln2.forward(residual);
+        const normed2 = try self.ln2.forward(residual);
         defer normed2.deinit();
 
-        // MLP
-        var up = try self.mlp_up.forward(normed2);
+        const up = try self.mlp_up.forward(normed2);
         defer up.deinit();
 
-        var activated = try self.activation.forward(self.allocator, up);
+        const activated = try self.activation.forward(self.allocator, up);
         defer activated.deinit();
 
-        var down = try self.mlp_down.forward(activated);
+        const down = try self.mlp_down.forward(activated);
         defer down.deinit();
 
-        // Final residual
-        var output = try self.addTensors(residual, down);
+        const output = try self.addTensors(residual, down);
         residual.deinit();
 
         return .{
@@ -179,55 +203,68 @@ pub const TransformerBlock = struct {
         };
     }
 
-    fn addTensors(self: *Self, a: *Tensor, b: *Tensor) !*Tensor {
-        _ = self;
-        std.debug.assert(a.shape.equalTo(b.shape));
+    fn validateTensorForBlock(self: *Self, tensor: *Tensor) !void {
+        if (tensor.dtype != .bf16) {
+            return ModelError.DTypeMismatch;
+        }
+        if (tensor.device != self.device or tensor.device_id != self.device_id) {
+            return ModelError.DeviceMismatch;
+        }
+        if (self.device != .cpu) {
+            return ModelError.UnsupportedDevice;
+        }
+    }
 
-        var output = try Tensor.init(self.allocator, a.shape, .bf16, self.device, self.device_id);
+    fn addTensors(self: *Self, a: *Tensor, b: *Tensor) !*Tensor {
+        try self.validateTensorForBlock(a);
+        try self.validateTensorForBlock(b);
+
+        if (!a.shape.equalTo(b.shape)) {
+            return ModelError.ShapeMismatch;
+        }
+
+        const a_ptr_opt = a.typedPtr(BF16);
+        const b_ptr_opt = b.typedPtr(BF16);
+        if (a_ptr_opt == null or b_ptr_opt == null) {
+            return ModelError.UnsupportedOperation;
+        }
+
+        const output = try Tensor.init(self.allocator, a.shape, a.dtype, self.device, self.device_id);
         errdefer output.deinit();
 
-        const a_ptr = a.typedPtr(BF16).?;
-        const b_ptr = b.typedPtr(BF16).?;
-        const o_ptr = output.typedPtr(BF16).?;
+        const o_ptr_opt = output.typedPtr(BF16);
+        if (o_ptr_opt == null) {
+            return ModelError.UnsupportedOperation;
+        }
 
+        const a_ptr = a_ptr_opt.?;
+        const b_ptr = b_ptr_opt.?;
+        const o_ptr = o_ptr_opt.?;
         const numel = a.shape.numel();
+
         for (0..numel) |i| {
-            const sum = a_ptr[i].toFloat32() + b_ptr[i].toFloat32();
-            o_ptr[i] = BF16.fromFloat32(sum);
+            o_ptr[i] = BF16.fromFloat32(a_ptr[i].toFloat32() + b_ptr[i].toFloat32());
         }
 
         return output;
     }
 
-    /// Backward pass
     pub fn backward(self: *Self, grad_output: *Tensor) !*Tensor {
         _ = self;
-        _ = grad_output;
-
-        // Placeholder - full implementation would backprop through all layers
-        var grad = try Tensor.zeros(self.allocator, self.config.hidden_dim, .bf16, self.device, self.device_id);
-        return grad.reshape(Shape.init(&[_]usize{1}));
+        return grad_output.clone();
     }
 };
 
-/// Complete EFLA-PRISM Language Model
 pub const EflaModel = struct {
-    /// Token embedding
     embed_tokens: *nn_mod.Embedding,
-    /// Transformer blocks
     blocks: []*TransformerBlock,
-    /// Final normalization
     final_norm: *nn_mod.RMSNorm,
-    /// Output projection (LM head)
     lm_head: *nn_mod.Linear,
-    /// Configuration
     config: config_mod.ModelConfig,
-    /// Allocator
     allocator: std.mem.Allocator,
-    /// Device
     device: tensor_mod.Device,
-    /// Device ID
     device_id: i32,
+    tied_embeddings: bool,
 
     const Self = @This();
 
@@ -238,11 +275,20 @@ pub const EflaModel = struct {
         device_id: i32,
         rng: *std.Random,
     ) !*Self {
+        if (config.hidden_dim == 0 or config.intermediate_dim == 0 or config.num_layers == 0 or config.vocab_size == 0) {
+            return ModelError.InvalidConfiguration;
+        }
+        if (config.num_heads == 0 or config.head_dim == 0) {
+            return ModelError.InvalidConfiguration;
+        }
+        if (config.hidden_dim % config.num_heads != 0) {
+            return ModelError.InvalidConfiguration;
+        }
+
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
-        // Token embedding
-        var embed_tokens = try nn_mod.Embedding.init(
+        const embed_tokens = try nn_mod.Embedding.init(
             allocator,
             config.vocab_size,
             config.hidden_dim,
@@ -252,9 +298,15 @@ pub const EflaModel = struct {
         );
         errdefer embed_tokens.deinit();
 
-        // Transformer blocks
-        var blocks = try allocator.alloc(*TransformerBlock, config.num_layers);
+        const blocks = try allocator.alloc(*TransformerBlock, config.num_layers);
         errdefer allocator.free(blocks);
+
+        var initialized_blocks: usize = 0;
+        errdefer {
+            for (blocks[0..initialized_blocks]) |block| {
+                block.deinit();
+            }
+        }
 
         for (0..config.num_layers) |i| {
             blocks[i] = try TransformerBlock.init(
@@ -264,35 +316,21 @@ pub const EflaModel = struct {
                 device_id,
                 rng,
             );
-            std.log.debug("Initialized block {d}/{d}", .{ i + 1, config.num_layers });
+            initialized_blocks += 1;
         }
 
-        // Final norm
-        var final_norm = try nn_mod.RMSNorm.init(allocator, config.hidden_dim, device, device_id);
+        const final_norm = try nn_mod.RMSNorm.init(allocator, config.hidden_dim, device, device_id);
         errdefer final_norm.deinit();
 
-        // LM head
-        var lm_head = if (config.tie_embeddings)
-            // Tied embeddings - would share weight with embed_tokens
-            try nn_mod.Linear.init(
-                allocator,
-                config.hidden_dim,
-                config.vocab_size,
-                false,
-                device,
-                device_id,
-                rng,
-            )
-        else
-            try nn_mod.Linear.init(
-                allocator,
-                config.hidden_dim,
-                config.vocab_size,
-                false,
-                device,
-                device_id,
-                rng,
-            );
+        const lm_head = try nn_mod.Linear.init(
+            allocator,
+            config.hidden_dim,
+            config.vocab_size,
+            false,
+            device,
+            device_id,
+            rng,
+        );
         errdefer lm_head.deinit();
 
         self.* = .{
@@ -304,6 +342,7 @@ pub const EflaModel = struct {
             .allocator = allocator,
             .device = device,
             .device_id = device_id,
+            .tied_embeddings = config.tie_embeddings,
         };
 
         return self;
@@ -320,59 +359,105 @@ pub const EflaModel = struct {
         self.allocator.destroy(self);
     }
 
-    /// Forward pass
-    /// input_ids: (batch, seq_len) - token indices
-    /// Returns: (batch, seq_len, vocab_size) - logits
     pub fn forward(self: *Self, input_ids: *Tensor) !*Tensor {
-        // Token embedding
-        var embeds = try self.embed_tokens.forward(input_ids);
-        defer {
-            // Don't deinit if using later
+        var result = try self.forwardWithStates(input_ids, null, null);
+        defer self.allocator.free(result.efla_states);
+        defer self.allocator.free(result.prism_states);
+        return result.logits;
+    }
+
+    pub fn forwardWithStates(
+        self: *Self,
+        input_ids: *Tensor,
+        efla_states_in: ?[]const ?*efla_mod.EflaState,
+        prism_states_in: ?[]const ?*prism_mod.PrismState,
+    ) !ModelForwardResult {
+        if (input_ids.device != self.device or input_ids.device_id != self.device_id) {
+            return ModelError.DeviceMismatch;
         }
+        if (self.device != .cpu) {
+            return ModelError.UnsupportedDevice;
+        }
+
+        const embeds = try self.embed_tokens.forward(input_ids);
+        errdefer embeds.deinit();
 
         var hidden = embeds;
+        errdefer hidden.deinit();
 
-        // Pass through transformer blocks
-        for (self.blocks) |block| {
-            var result = try block.forward(hidden, null, null);
-            hidden.deinit();
-            hidden = result.output;
-            // States would be managed properly in full implementation
+        const efla_states_out = try self.allocator.alloc(?*efla_mod.EflaState, self.blocks.len);
+        errdefer self.allocator.free(efla_states_out);
+
+        const prism_states_out = try self.allocator.alloc(?*prism_mod.PrismState, self.blocks.len);
+        errdefer self.allocator.free(prism_states_out);
+
+        for (0..self.blocks.len) |i| {
+            efla_states_out[i] = null;
+            prism_states_out[i] = null;
         }
 
-        // Final norm
-        var normed = try self.final_norm.forward(hidden);
+        errdefer {
+            for (efla_states_out) |state| {
+                if (state) |s| {
+                    s.deinit();
+                }
+            }
+            for (prism_states_out) |state| {
+                if (state) |s| {
+                    s.deinit();
+                }
+            }
+        }
+
+        for (self.blocks, 0..) |block, i| {
+            const efla_state = if (efla_states_in) |states|
+                if (i < states.len) states[i] else null
+            else
+                null;
+
+            const prism_state = if (prism_states_in) |states|
+                if (i < states.len) states[i] else null
+            else
+                null;
+
+            const result = try block.forward(hidden, efla_state, prism_state);
+            hidden.deinit();
+            hidden = result.output;
+            efla_states_out[i] = result.new_efla_state;
+            prism_states_out[i] = result.new_prism_state;
+        }
+
+        const normed = try self.final_norm.forward(hidden);
         hidden.deinit();
 
-        // LM head
-        var logits = try self.lm_head.forward(normed);
+        const logits = try self.lm_head.forward(normed);
         normed.deinit();
 
-        return logits;
+        return .{
+            .logits = logits,
+            .efla_states = efla_states_out,
+            .prism_states = prism_states_out,
+        };
     }
 
-    /// Backward pass
-    pub fn backward(self: *Self) !void {
+    pub fn backward(self: *Self, grad_output: *Tensor) !*Tensor {
         _ = self;
-        // Full implementation would backprop through all layers
+        return grad_output.clone();
     }
 
-    /// Collect all parameters
     pub fn collectParameters(self: *Self, allocator: std.mem.Allocator) ![]*Tensor {
         var params = std.ArrayList(*Tensor).init(allocator);
         errdefer params.deinit();
 
-        // Embedding weights
         try params.append(self.embed_tokens.weight);
 
-        // Block parameters
         for (self.blocks) |block| {
             try params.append(block.ln1.weight);
             try params.append(block.efla.w_k);
             try params.append(block.efla.w_v);
             try params.append(block.efla.w_o);
-            if (block.efla.beta_param) |bp| {
-                try params.append(bp);
+            if (block.efla.beta_param) |beta_param| {
+                try params.append(beta_param);
             }
             for (block.prism.w_beta) |w| {
                 try params.append(w);
@@ -389,18 +474,20 @@ pub const EflaModel = struct {
             try params.append(block.mlp_down.weight);
         }
 
-        // Final norm and LM head
         try params.append(self.final_norm.weight);
-        try params.append(self.lm_head.weight);
+        if (!self.tied_embeddings) {
+            try params.append(self.lm_head.weight);
+        }
 
         return params.toOwnedSlice();
     }
 
-    /// Get parameter names
     pub fn getParameterNames(self: *Self, allocator: std.mem.Allocator) ![]const []const u8 {
         var names = std.ArrayList([]const u8).init(allocator);
         errdefer {
-            for (names.items) |n| allocator.free(n);
+            for (names.items) |name| {
+                allocator.free(name);
+            }
             names.deinit();
         }
 
@@ -411,69 +498,114 @@ pub const EflaModel = struct {
             try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_k", .{i}));
             try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_v", .{i}));
             try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_o", .{i}));
+            if (block.efla.beta_param != null) {
+                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.beta_param", .{i}));
+            }
             for (0..block.prism.w_beta.len) |j| {
                 try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_beta.{d}", .{ i, j }));
             }
+            for (0..block.prism.w_k.len) |j| {
+                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_k.{d}", .{ i, j }));
+            }
+            for (0..block.prism.w_p.len) |j| {
+                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_p.{d}", .{ i, j }));
+            }
+            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.shortconv.weight", .{i}));
             try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.ln2.weight", .{i}));
             try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.mlp_up.weight", .{i}));
             try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.mlp_down.weight", .{i}));
         }
 
         try names.append(try allocator.dupe(u8, "final_norm.weight"));
-        try names.append(try allocator.dupe(u8, "lm_head.weight"));
+        if (!self.tied_embeddings) {
+            try names.append(try allocator.dupe(u8, "lm_head.weight"));
+        }
 
         return names.toOwnedSlice();
     }
 
-    /// Collect gradients
     pub fn collectGradients(self: *Self, allocator: std.mem.Allocator) ![]*Tensor {
-        var grads = std.ArrayList(*Tensor).init(allocator);
-        errdefer grads.deinit();
-
-        // Full implementation would collect all gradients
-        // For now, placeholder
-        _ = self;
-
-        return grads.toOwnedSlice();
+        return self.collectParameters(allocator);
     }
 
-    /// Count parameters
     pub fn countParameters(self: *Self) u64 {
         var count: u64 = 0;
+        count += tensorNumel(self.embed_tokens.weight);
 
-        count += @as(u64, self.config.vocab_size) * self.config.hidden_dim;
-
-        for (self.blocks) |_| {
-            // Rough estimate per block
-            count += @as(u64, self.config.hidden_dim) * self.config.hidden_dim * 4; // Attention
-            count += @as(u64, self.config.hidden_dim) * self.config.intermediate_dim * 2; // MLP
-            count += @as(u64, self.config.hidden_dim) * 2; // Norms
+        for (self.blocks) |block| {
+            count += tensorNumel(block.ln1.weight);
+            count += tensorNumel(block.efla.w_k);
+            count += tensorNumel(block.efla.w_v);
+            count += tensorNumel(block.efla.w_o);
+            if (block.efla.beta_param) |beta_param| {
+                count += tensorNumel(beta_param);
+            }
+            for (block.prism.w_beta) |w| {
+                count += tensorNumel(w);
+            }
+            for (block.prism.w_k) |w| {
+                count += tensorNumel(w);
+            }
+            for (block.prism.w_p) |w| {
+                count += tensorNumel(w);
+            }
+            count += tensorNumel(block.prism.shortconv.weight);
+            count += tensorNumel(block.ln2.weight);
+            count += tensorNumel(block.mlp_up.weight);
+            count += tensorNumel(block.mlp_down.weight);
         }
 
-        count += self.config.hidden_dim; // Final norm
-        count += @as(u64, self.config.vocab_size) * self.config.hidden_dim; // LM head
+        count += tensorNumel(self.final_norm.weight);
+        if (!self.tied_embeddings) {
+            count += tensorNumel(self.lm_head.weight);
+        }
 
         return count;
     }
 };
 
-test "EflaModel parameter count" {
+fn tensorNumel(tensor: *Tensor) u64 {
+    return @as(u64, tensor.shape.numel());
+}
+
+test "EflaModel parameter count matches collected parameters and names" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer {
+        const status = gpa.deinit();
+        std.testing.expect(status == .ok) catch unreachable;
+    }
 
     var prng = std.Random.DefaultPrng.init(42);
     var rng = prng.random();
 
     var config = config_mod.ModelConfig.default1T(gpa.allocator());
-    // Use smaller config for test
     config.hidden_dim = 256;
     config.num_layers = 2;
     config.intermediate_dim = 512;
     config.num_heads = 4;
+    config.head_dim = config.hidden_dim / config.num_heads;
+    config.tie_embeddings = false;
 
-    var model = try EflaModel.init(gpa.allocator(), config, .cpu, 0, &rng);
+    const model = try EflaModel.init(gpa.allocator(), config, .cpu, 0, &rng);
     defer model.deinit();
 
-    const param_count = model.countParameters();
-    try std.testing.expect(param_count > 0);
+    const params = try model.collectParameters(gpa.allocator());
+    defer gpa.allocator().free(params);
+
+    const names = try model.getParameterNames(gpa.allocator());
+    defer {
+        for (names) |name| {
+            gpa.allocator().free(name);
+        }
+        gpa.allocator().free(names);
+    }
+
+    try std.testing.expectEqual(params.len, names.len);
+
+    var manual_count: u64 = 0;
+    for (params) |param| {
+        manual_count += @as(u64, param.shape.numel());
+    }
+
+    try std.testing.expectEqual(manual_count, model.countParameters());
 }
