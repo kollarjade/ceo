@@ -15,18 +15,16 @@ pub const std_options = std.Options{
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{
-        .enable_memory_limit = true,
-        .enable_thread_safety = true,
+        .thread_safe = true,
     }){};
     defer _ = gpa.deinit();
 
     const allocator = gpa.allocator();
 
-    // Parse command line arguments
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
-    _ = args.next(); // Skip program name
+    _ = args.next();
 
     const command_str = args.next() orelse {
         try printUsage();
@@ -126,12 +124,11 @@ fn runTrain(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void 
     }
 
     const cfg_path = config_path orelse return error.MissingConfig;
-    const cfg = try config.Config.parseFromFile(allocator, cfg_path);
+    var cfg = try config.Config.parseFromFile(allocator, cfg_path);
     defer cfg.deinit(allocator);
 
     std.log.info("Starting training with config: {s}", .{cfg_path});
 
-    // Initialize distributed runtime
     var dist_runtime = try runtime.DistributedRuntime.init(allocator, cfg.runtime);
     defer dist_runtime.deinit();
 
@@ -140,11 +137,9 @@ fn runTrain(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void 
         dist_runtime.world_size,
     });
 
-    // Initialize telemetry
     var tele = try telemetry.Telemetry.init(allocator, cfg.telemetry, dist_runtime.rank);
     defer tele.deinit();
 
-    // Run training
     var train = try trainer.Trainer.init(allocator, cfg, &dist_runtime, &tele);
     defer train.deinit();
 
@@ -178,11 +173,13 @@ fn runEvaluate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     const ckpt_path = checkpoint_path orelse return error.MissingCheckpoint;
     const data = data_path orelse return error.MissingDataPath;
 
-    // Load config from checkpoint or provided path
-    const cfg: config.Config = if (config_path) |path|
+    const cfg_path_alloc = try std.fmt.allocPrint(allocator, "{s}/config.yaml", .{ckpt_path});
+    defer allocator.free(cfg_path_alloc);
+
+    var cfg: config.Config = if (config_path) |path|
         try config.Config.parseFromFile(allocator, path)
     else
-        try config.Config.parseFromFile(allocator, try std.fmt.bufPrint(try allocator.alloc(u8, 4096), "{s}/config.yaml", .{ckpt_path}));
+        try config.Config.parseFromFile(allocator, cfg_path_alloc);
     defer cfg.deinit(allocator);
 
     var eval = try evaluator.Evaluator.init(allocator, cfg, ckpt_path);
@@ -225,17 +222,20 @@ fn runGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     const ckpt_path = checkpoint_path orelse return error.MissingCheckpoint;
     const prompt_text = prompt orelse "";
 
-    // Load config
-    const cfg: config.Config = if (config_path) |path|
+    const cfg_path_alloc = try std.fmt.allocPrint(allocator, "{s}/config.yaml", .{ckpt_path});
+    defer allocator.free(cfg_path_alloc);
+
+    var cfg: config.Config = if (config_path) |path|
         try config.Config.parseFromFile(allocator, path)
     else
-        try config.Config.parseFromFile(allocator, try std.fmt.bufPrint(try allocator.alloc(u8, 4096), "{s}/config.yaml", .{ckpt_path}));
+        try config.Config.parseFromFile(allocator, cfg_path_alloc);
     defer cfg.deinit(allocator);
 
     var gen = try evaluator.Generator.init(allocator, cfg, ckpt_path);
     defer gen.deinit();
 
     const output = try gen.generate(prompt_text, max_new_tokens, temperature, top_p);
+    defer allocator.free(output);
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("{s}\n", .{output});
@@ -246,11 +246,9 @@ fn runSmokeTest(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !v
 
     std.log.info("Running smoke test...", .{});
 
-    // Load smoke test config
-    const cfg = try config.Config.parseFromFile(allocator, "configs/smoke.yaml");
+    var cfg = try config.Config.parseFromFile(allocator, "configs/smoke.yaml");
     defer cfg.deinit(allocator);
 
-    // Verify GPU availability
     var gpu_check = try runtime.cuda.initCUDA();
     defer gpu_check.deinit();
 
@@ -261,7 +259,6 @@ fn runSmokeTest(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !v
 
     std.log.info("Found {d} CUDA device(s)", .{gpu_check.device_count});
 
-    // Run minimal training iteration
     var dist_runtime = try runtime.DistributedRuntime.initSingleGPU(allocator);
     defer dist_runtime.deinit();
 
@@ -405,7 +402,7 @@ fn runTokenizer(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !v
                 var list = std.ArrayList(u32).init(allocator);
                 defer list.deinit();
 
-                var iter = std.mem.split(u8, tokens_str, ",");
+                var iter = std.mem.splitScalar(u8, tokens_str, ',');
                 while (iter.next()) |t| {
                     const trimmed = std.mem.trim(u8, t, " \t\n");
                     if (trimmed.len > 0) {
@@ -418,6 +415,7 @@ fn runTokenizer(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !v
 
         const tok_path = tokenizer_path orelse return error.MissingTokenizer;
         const token_list = tokens orelse return error.MissingTokens;
+        defer allocator.free(token_list);
 
         var tok = try tokenizer_mod.Tokenizer.load(allocator, tok_path);
         defer tok.deinit();
@@ -443,27 +441,22 @@ fn runValidate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     }
 
     const cfg_path = config_path orelse return error.MissingConfig;
-    const cfg = try config.Config.parseFromFile(allocator, cfg_path);
+    var cfg = try config.Config.parseFromFile(allocator, cfg_path);
     defer cfg.deinit(allocator);
 
     std.log.info("Validating configuration...", .{});
 
-    // Validate model configuration
     try cfg.model.validate();
-
-    // Validate training configuration
     try cfg.training.validate();
 
-    // Validate memory requirements
     const mem_estimate = try cfg.model.estimateMemory();
     std.log.info("Estimated memory per GPU: {d:.2} GB", .{@as(f64, @floatFromInt(mem_estimate)) / (1024.0 * 1024.0 * 1024.0)});
 
-    // Validate parameter count
     const param_count = try cfg.model.countParameters();
     std.log.info("Total parameters: {d}", .{param_count});
 
-    const target_params: u64 = 1_000_000_000_000; // 1T
-    const tolerance: f64 = 0.05; // 5% tolerance
+    const target_params: u64 = 1_000_000_000_000;
+    const tolerance: f64 = 0.05;
     const ratio = @as(f64, @floatFromInt(param_count)) / @as(f64, @floatFromInt(target_params));
 
     if (ratio < (1.0 - tolerance) or ratio > (1.0 + tolerance)) {
