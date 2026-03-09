@@ -1,16 +1,82 @@
-/**
- * Normalization and Activation Kernels
- * SM100-optimized implementations
- */
-
 #include "include/kernels.h"
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-// ============================================================================
-// RMSNorm Forward Kernel
-// ============================================================================
+namespace {
+
+constexpr int kBlockSize = 256;
+constexpr unsigned int kMaxGridX = 65535u;
+
+inline bool is_finite_scalar(float x) {
+    return std::isfinite(static_cast<double>(x));
+}
+
+inline bool safe_mul_size(size_t a, size_t b, size_t* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    if (a == 0 || b == 0) {
+        *out = 0;
+        return true;
+    }
+    if (a > std::numeric_limits<size_t>::max() / b) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+inline size_t ceil_div_size(size_t a, size_t b) {
+    return (a + b - 1) / b;
+}
+
+inline int launch_block_size(size_t work_items) {
+    size_t block = std::min<size_t>(work_items, static_cast<size_t>(kBlockSize));
+    if (block == 0) {
+        block = 1;
+    }
+    return static_cast<int>(block);
+}
+
+inline int launch_grid_size_for_rows(size_t rows) {
+    if (rows == 0) {
+        return 0;
+    }
+    return static_cast<int>(std::min<size_t>(rows, static_cast<size_t>(kMaxGridX)));
+}
+
+inline int launch_grid_size_for_numel(size_t numel, int block_size) {
+    if (numel == 0) {
+        return 0;
+    }
+    size_t blocks = ceil_div_size(numel, static_cast<size_t>(block_size));
+    blocks = std::min<size_t>(blocks, static_cast<size_t>(kMaxGridX));
+    return static_cast<int>(blocks);
+}
+
+inline cudaError_t free_if_needed(void* ptr) {
+    if (ptr == nullptr) {
+        return cudaSuccess;
+    }
+    return cudaFree(ptr);
+}
+
+__device__ __forceinline__ float gelu_approximate_device(float x) {
+    constexpr float k = 0.7978845608028654f;
+    float x3 = x * x * x;
+    return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x3)));
+}
+
+__device__ __forceinline__ float gelu_exact_device(float x) {
+    constexpr float inv_sqrt2 = 0.7071067811865475f;
+    return 0.5f * x * (1.0f + erff(x * inv_sqrt2));
+}
 
 __global__ void rmsnorm_forward_kernel(
     const __nv_bfloat16* __restrict__ input,
@@ -20,115 +86,109 @@ __global__ void rmsnorm_forward_kernel(
     size_t normalized_shape,
     float eps
 ) {
-    size_t row_idx = blockIdx.x;
+    __shared__ float shared[kBlockSize];
+    for (size_t row_idx = static_cast<size_t>(blockIdx.x); row_idx < n_rows; row_idx += static_cast<size_t>(gridDim.x)) {
+        const __nv_bfloat16* row_in = input + row_idx * normalized_shape;
+        __nv_bfloat16* row_out = output + row_idx * normalized_shape;
 
-    if (row_idx >= n_rows) return;
+        float local_sum_sq = 0.0f;
+        for (size_t i = static_cast<size_t>(threadIdx.x); i < normalized_shape; i += static_cast<size_t>(blockDim.x)) {
+            float x = __bfloat162float(row_in[i]);
+            local_sum_sq += x * x;
+        }
 
-    const __nv_bfloat16* row_in = input + row_idx * normalized_shape;
-    __nv_bfloat16* row_out = output + row_idx * normalized_shape;
+        shared[threadIdx.x] = local_sum_sq;
+        __syncthreads();
 
-    // Compute sum of squares
-    float sum_sq = 0.0f;
-    for (size_t i = threadIdx.x; i < normalized_shape; i += blockDim.x) {
-        float val = __bfloat162float(row_in[i]);
-        sum_sq += val * val;
-    }
+        for (unsigned int stride = static_cast<unsigned int>(blockDim.x) >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                shared[threadIdx.x] += shared[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
 
-    // Reduce within block
-    __shared__ float shared_sum;
-    if (threadIdx.x == 0) shared_sum = 0.0f;
-    __syncthreads();
+        float inv_rms = rsqrtf(shared[0] / static_cast<float>(normalized_shape) + eps);
 
-    atomicAdd(&shared_sum, sum_sq);
-    __syncthreads();
+        for (size_t i = static_cast<size_t>(threadIdx.x); i < normalized_shape; i += static_cast<size_t>(blockDim.x)) {
+            float x = __bfloat162float(row_in[i]);
+            float w = __bfloat162float(weight[i]);
+            row_out[i] = __float2bfloat16_rn(x * inv_rms * w);
+        }
 
-    float mean_sq = shared_sum / normalized_shape;
-    float rsqrt = rsqrtf(mean_sq + eps);
-
-    // Normalize and scale
-    for (size_t i = threadIdx.x; i < normalized_shape; i += blockDim.x) {
-        float val = __bfloat162float(row_in[i]);
-        float w = __bfloat162float(weight[i]);
-        row_out[i] = __float2bfloat16(val * rsqrt * w);
+        __syncthreads();
     }
 }
-
-// ============================================================================
-// RMSNorm Backward Kernel
-// ============================================================================
 
 __global__ void rmsnorm_backward_kernel(
     const __nv_bfloat16* __restrict__ grad_output,
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ grad_input,
-    __nv_bfloat16* __restrict__ grad_weight,
+    float* __restrict__ grad_weight_accum,
     size_t n_rows,
     size_t normalized_shape,
     float eps
 ) {
-    size_t row_idx = blockIdx.x;
+    __shared__ float shared_sum_sq[kBlockSize];
+    __shared__ float shared_dot[kBlockSize];
 
-    if (row_idx >= n_rows) return;
+    for (size_t row_idx = static_cast<size_t>(blockIdx.x); row_idx < n_rows; row_idx += static_cast<size_t>(gridDim.x)) {
+        const __nv_bfloat16* row_grad_out = grad_output + row_idx * normalized_shape;
+        const __nv_bfloat16* row_in = input + row_idx * normalized_shape;
+        __nv_bfloat16* row_grad_in = grad_input + row_idx * normalized_shape;
 
-    const __nv_bfloat16* row_in = input + row_idx * normalized_shape;
-    const __nv_bfloat16* row_grad = grad_output + row_idx * normalized_shape;
-    __nv_bfloat16* row_grad_in = grad_input + row_idx * normalized_shape;
-
-    // Recompute normalization stats
-    float sum_sq = 0.0f;
-    for (size_t i = threadIdx.x; i < normalized_shape; i += blockDim.x) {
-        float val = __bfloat162float(row_in[i]);
-        sum_sq += val * val;
-    }
-
-    __shared__ float shared_sum;
-    if (threadIdx.x == 0) shared_sum = 0.0f;
-    __syncthreads();
-    atomicAdd(&shared_sum, sum_sq);
-    __syncthreads();
-
-    float mean_sq = shared_sum / normalized_shape;
-    float rsqrt = rsqrtf(mean_sq + eps);
-
-    // Compute sum of weighted gradients
-    float sum_grad_weighted = 0.0f;
-    for (size_t i = threadIdx.x; i < normalized_shape; i += blockDim.x) {
-        float g = __bfloat162float(row_grad[i]);
-        float w = __bfloat162float(weight[i]);
-        float x = __bfloat162float(row_in[i]);
-        sum_grad_weighted += g * w * x;
-    }
-
-    __shared__ float shared_grad_sum;
-    if (threadIdx.x == 0) shared_grad_sum = 0.0f;
-    __syncthreads();
-    atomicAdd(&shared_grad_sum, sum_grad_weighted);
-    __syncthreads();
-
-    float norm_factor = rsqrt / normalized_shape;
-
-    // Backprop
-    for (size_t i = threadIdx.x; i < normalized_shape; i += blockDim.x) {
-        float g = __bfloat162float(row_grad[i]);
-        float w = __bfloat162float(weight[i]);
-        float x = __bfloat162float(row_in[i]);
-        float grad = w * rsqrt * g - x * norm_factor * shared_grad_sum;
-        row_grad_in[i] = __float2bfloat16(grad);
-
-        // Accumulate weight gradient (if provided)
-        if (grad_weight) {
-            atomicAdd(
-                reinterpret_cast<float*>(&grad_weight[i]),
-                g * x * rsqrt
-            );
+        float local_sum_sq = 0.0f;
+        for (size_t i = static_cast<size_t>(threadIdx.x); i < normalized_shape; i += static_cast<size_t>(blockDim.x)) {
+            float x = __bfloat162float(row_in[i]);
+            local_sum_sq += x * x;
         }
+
+        shared_sum_sq[threadIdx.x] = local_sum_sq;
+        __syncthreads();
+
+        for (unsigned int stride = static_cast<unsigned int>(blockDim.x) >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                shared_sum_sq[threadIdx.x] += shared_sum_sq[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        float inv_rms = rsqrtf(shared_sum_sq[0] / static_cast<float>(normalized_shape) + eps);
+
+        float local_dot = 0.0f;
+        for (size_t i = static_cast<size_t>(threadIdx.x); i < normalized_shape; i += static_cast<size_t>(blockDim.x)) {
+            float g = __bfloat162float(row_grad_out[i]);
+            float x = __bfloat162float(row_in[i]);
+            float w = __bfloat162float(weight[i]);
+            local_dot += g * w * x;
+        }
+
+        shared_dot[threadIdx.x] = local_dot;
+        __syncthreads();
+
+        for (unsigned int stride = static_cast<unsigned int>(blockDim.x) >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                shared_dot[threadIdx.x] += shared_dot[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        float coeff = shared_dot[0] * inv_rms * inv_rms * inv_rms / static_cast<float>(normalized_shape);
+
+        for (size_t i = static_cast<size_t>(threadIdx.x); i < normalized_shape; i += static_cast<size_t>(blockDim.x)) {
+            float g = __bfloat162float(row_grad_out[i]);
+            float x = __bfloat162float(row_in[i]);
+            float w = __bfloat162float(weight[i]);
+            float dx = g * w * inv_rms - x * coeff;
+            row_grad_in[i] = __float2bfloat16_rn(dx);
+            if (grad_weight_accum != nullptr) {
+                atomicAdd(&grad_weight_accum[i], g * x * inv_rms);
+            }
+        }
+
+        __syncthreads();
     }
 }
-
-// ============================================================================
-// LayerNorm Forward Kernel
-// ============================================================================
 
 __global__ void layernorm_forward_kernel(
     const __nv_bfloat16* __restrict__ input,
@@ -139,64 +199,48 @@ __global__ void layernorm_forward_kernel(
     size_t normalized_shape,
     float eps
 ) {
-    size_t row_idx = blockIdx.x;
+    __shared__ float shared_sum[kBlockSize];
+    __shared__ float shared_sum_sq[kBlockSize];
 
-    if (row_idx >= n_rows) return;
+    for (size_t row_idx = static_cast<size_t>(blockIdx.x); row_idx < n_rows; row_idx += static_cast<size_t>(gridDim.x)) {
+        const __nv_bfloat16* row_in = input + row_idx * normalized_shape;
+        __nv_bfloat16* row_out = output + row_idx * normalized_shape;
 
-    const __nv_bfloat16* row_in = input + row_idx * normalized_shape;
-    __nv_bfloat16* row_out = output + row_idx * normalized_shape;
+        float local_sum = 0.0f;
+        float local_sum_sq = 0.0f;
+        for (size_t i = static_cast<size_t>(threadIdx.x); i < normalized_shape; i += static_cast<size_t>(blockDim.x)) {
+            float x = __bfloat162float(row_in[i]);
+            local_sum += x;
+            local_sum_sq += x * x;
+        }
 
-    // Compute mean and variance
-    float sum = 0.0f;
-    float sum_sq = 0.0f;
+        shared_sum[threadIdx.x] = local_sum;
+        shared_sum_sq[threadIdx.x] = local_sum_sq;
+        __syncthreads();
 
-    for (size_t i = threadIdx.x; i < normalized_shape; i += blockDim.x) {
-        float val = __bfloat162float(row_in[i]);
-        sum += val;
-        sum_sq += val * val;
+        for (unsigned int stride = static_cast<unsigned int>(blockDim.x) >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+                shared_sum_sq[threadIdx.x] += shared_sum_sq[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        float mean = shared_sum[0] / static_cast<float>(normalized_shape);
+        float variance = shared_sum_sq[0] / static_cast<float>(normalized_shape) - mean * mean;
+        variance = fmaxf(variance, 0.0f);
+        float inv_std = rsqrtf(variance + eps);
+
+        for (size_t i = static_cast<size_t>(threadIdx.x); i < normalized_shape; i += static_cast<size_t>(blockDim.x)) {
+            float x = __bfloat162float(row_in[i]);
+            float w = __bfloat162float(weight[i]);
+            float b = bias != nullptr ? __bfloat162float(bias[i]) : 0.0f;
+            float y = (x - mean) * inv_std;
+            row_out[i] = __float2bfloat16_rn(y * w + b);
+        }
+
+        __syncthreads();
     }
-
-    __shared__ float shared_sum;
-    __shared__ float shared_sum_sq;
-    if (threadIdx.x == 0) {
-        shared_sum = 0.0f;
-        shared_sum_sq = 0.0f;
-    }
-    __syncthreads();
-
-    atomicAdd(&shared_sum, sum);
-    atomicAdd(&shared_sum_sq, sum_sq);
-    __syncthreads();
-
-    float mean = shared_sum / normalized_shape;
-    float variance = shared_sum_sq / normalized_shape - mean * mean;
-    float inv_std = rsqrtf(variance + eps);
-
-    // Normalize
-    for (size_t i = threadIdx.x; i < normalized_shape; i += blockDim.x) {
-        float val = __bfloat162float(row_in[i]);
-        float w = __bfloat162float(weight[i]);
-        float b = bias ? __bfloat162float(bias[i]) : 0.0f;
-        float normalized = (val - mean) * inv_std;
-        row_out[i] = __float2bfloat16(normalized * w + b);
-    }
-}
-
-// ============================================================================
-// GELU Forward Kernel
-// ============================================================================
-
-__device__ __forceinline__ float gelu_approximate(float x) {
-    // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    constexpr float sqrt_2_over_pi = 0.7978845608028654f;
-    float x3 = x * x * x;
-    return 0.5f * x * (1.0f + tanhf(sqrt_2_over_pi * (x + 0.044715f * x3)));
-}
-
-__device__ __forceinline__ float gelu_exact(float x) {
-    // x * Φ(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
-    constexpr float sqrt2 = 1.41421356237f;
-    return 0.5f * x * (1.0f + erff(x / sqrt2));
 }
 
 __global__ void gelu_forward_kernel(
@@ -205,13 +249,14 @@ __global__ void gelu_forward_kernel(
     size_t numel,
     bool approximate
 ) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx >= numel) return;
-
-    float x = __bfloat162float(input[idx]);
-    float y = approximate ? gelu_approximate(x) : gelu_exact(x);
-    output[idx] = __float2bfloat16(y);
+    size_t stride = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
+    for (size_t idx = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
+         idx < numel;
+         idx += stride) {
+        float x = __bfloat162float(input[idx]);
+        float y = approximate ? gelu_approximate_device(x) : gelu_exact_device(x);
+        output[idx] = __float2bfloat16_rn(y);
+    }
 }
 
 __global__ void gelu_backward_kernel(
@@ -221,37 +266,34 @@ __global__ void gelu_backward_kernel(
     size_t numel,
     bool approximate
 ) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
+    for (size_t idx = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
+         idx < numel;
+         idx += stride) {
+        float x = __bfloat162float(input[idx]);
+        float g = __bfloat162float(grad_output[idx]);
+        float grad = 0.0f;
 
-    if (idx >= numel) return;
+        if (approximate) {
+            constexpr float k = 0.7978845608028654f;
+            float x2 = x * x;
+            float x3 = x2 * x;
+            float t = k * (x + 0.044715f * x3);
+            float th = tanhf(t);
+            float sech2 = 1.0f - th * th;
+            float dt = k * (1.0f + 3.0f * 0.044715f * x2);
+            grad = 0.5f * (1.0f + th) + 0.5f * x * sech2 * dt;
+        } else {
+            constexpr float inv_sqrt2 = 0.7071067811865475f;
+            constexpr float inv_sqrt_2pi = 0.3989422804014327f;
+            float cdf = 0.5f * (1.0f + erff(x * inv_sqrt2));
+            float pdf = expf(-0.5f * x * x) * inv_sqrt_2pi;
+            grad = cdf + x * pdf;
+        }
 
-    float x = __bfloat162float(input[idx]);
-    float g = __bfloat162float(grad_output[idx]);
-
-    float grad;
-    if (approximate) {
-        // Derivative of approximate GELU
-        constexpr float sqrt_2_over_pi = 0.7978845608028654f;
-        float x3 = x * x * x;
-        float tanh_arg = sqrt_2_over_pi * (x + 0.044715f * x3);
-        float tanh_val = tanhf(tanh_arg);
-        float sech_sq = 1.0f - tanh_val * tanh_val;
-        float inner_deriv = sqrt_2_over_pi * (1.0f + 3.0f * 0.044715f * x * x);
-        grad = 0.5f * (1.0f + tanh_val) + 0.5f * x * sech_sq * inner_deriv;
-    } else {
-        // Derivative of exact GELU
-        constexpr float sqrt2 = 1.41421356237f;
-        float cdf = 0.5f * (1.0f + erff(x / sqrt2));
-        float pdf = expf(-0.5f * x * x) * 0.3989422804f; // 1/sqrt(2*pi)
-        grad = cdf + x * pdf;
+        grad_input[idx] = __float2bfloat16_rn(g * grad);
     }
-
-    grad_input[idx] = __float2bfloat16(g * grad);
 }
-
-// ============================================================================
-// Softmax Forward Kernel
-// ============================================================================
 
 __global__ void softmax_forward_kernel(
     const __nv_bfloat16* __restrict__ input,
@@ -260,47 +302,76 @@ __global__ void softmax_forward_kernel(
     size_t dim_size,
     size_t inner_size
 ) {
-    size_t outer_idx = blockIdx.x / inner_size;
-    size_t inner_idx = blockIdx.x % inner_size;
+    __shared__ float shared_max[kBlockSize];
+    __shared__ float shared_sum[kBlockSize];
 
-    if (outer_idx >= outer_size) return;
+    size_t rows = outer_size * inner_size;
 
-    size_t offset = outer_idx * dim_size * inner_size + inner_idx;
+    for (size_t row = static_cast<size_t>(blockIdx.x); row < rows; row += static_cast<size_t>(gridDim.x)) {
+        size_t outer_idx = row / inner_size;
+        size_t inner_idx = row % inner_size;
+        size_t base = outer_idx * dim_size * inner_size + inner_idx;
 
-    // Find max for numerical stability
-    __shared__ float max_val;
-    if (threadIdx.x == 0) max_val = -INFINITY;
-    __syncthreads();
+        float local_max = -CUDART_INF_F;
+        for (size_t i = static_cast<size_t>(threadIdx.x); i < dim_size; i += static_cast<size_t>(blockDim.x)) {
+            float x = __bfloat162float(input[base + i * inner_size]);
+            local_max = fmaxf(local_max, x);
+        }
 
-    for (size_t i = threadIdx.x; i < dim_size; i += blockDim.x) {
-        float val = __bfloat162float(input[offset + i * inner_size]);
-        atomicMax(reinterpret_cast<int*>(&max_val), __float_as_int(val));
-    }
-    __syncthreads();
+        shared_max[threadIdx.x] = local_max;
+        __syncthreads();
 
-    // Compute exp and sum
-    __shared__ float sum_exp;
-    if (threadIdx.x == 0) sum_exp = 0.0f;
-    __syncthreads();
+        for (unsigned int stride = static_cast<unsigned int>(blockDim.x) >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                shared_max[threadIdx.x] = fmaxf(shared_max[threadIdx.x], shared_max[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
 
-    for (size_t i = threadIdx.x; i < dim_size; i += blockDim.x) {
-        float val = __bfloat162float(input[offset + i * inner_size]);
-        float exp_val = expf(val - max_val);
-        output[offset + i * inner_size] = __float2bfloat16(exp_val);
-        atomicAdd(&sum_exp, exp_val);
-    }
-    __syncthreads();
+        float row_max = shared_max[0];
 
-    // Normalize
-    for (size_t i = threadIdx.x; i < dim_size; i += blockDim.x) {
-        float val = __bfloat162float(output[offset + i * inner_size]);
-        output[offset + i * inner_size] = __float2bfloat16(val / sum_exp);
+        float local_sum = 0.0f;
+        for (size_t i = static_cast<size_t>(threadIdx.x); i < dim_size; i += static_cast<size_t>(blockDim.x)) {
+            float x = __bfloat162float(input[base + i * inner_size]);
+            local_sum += expf(x - row_max);
+        }
+
+        shared_sum[threadIdx.x] = local_sum;
+        __syncthreads();
+
+        for (unsigned int stride = static_cast<unsigned int>(blockDim.x) >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        float denom = shared_sum[0];
+
+        for (size_t i = static_cast<size_t>(threadIdx.x); i < dim_size; i += static_cast<size_t>(blockDim.x)) {
+            float x = __bfloat162float(input[base + i * inner_size]);
+            float y = expf(x - row_max) / denom;
+            output[base + i * inner_size] = __float2bfloat16_rn(y);
+        }
+
+        __syncthreads();
     }
 }
 
-// ============================================================================
-// Host Functions
-// ============================================================================
+__global__ void float_to_bf16_kernel(
+    const float* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    size_t numel
+) {
+    size_t stride = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
+    for (size_t idx = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
+         idx < numel;
+         idx += stride) {
+        output[idx] = __float2bfloat16_rn(input[idx]);
+    }
+}
+
+}
 
 extern "C" {
 
@@ -313,10 +384,27 @@ cudaError_t rmsnorm_forward_cuda(
     float eps,
     cudaStream_t stream
 ) {
-    size_t n_rows = numel / normalized_shape;
-    size_t block_size = min(normalized_shape, (size_t)256);
+    if (numel == 0) {
+        return cudaSuccess;
+    }
+    if (input == nullptr || weight == nullptr || output == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (normalized_shape == 0 || numel % normalized_shape != 0) {
+        return cudaErrorInvalidValue;
+    }
+    if (!is_finite_scalar(eps) || eps <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
 
-    rmsnorm_forward_kernel<<<n_rows, block_size, 0, stream>>>(
+    size_t n_rows = numel / normalized_shape;
+    int block_size = launch_block_size(normalized_shape);
+    int grid_size = launch_grid_size_for_rows(n_rows);
+    if (grid_size == 0) {
+        return cudaSuccess;
+    }
+
+    rmsnorm_forward_kernel<<<grid_size, block_size, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input),
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<__nv_bfloat16*>(output),
@@ -325,7 +413,7 @@ cudaError_t rmsnorm_forward_cuda(
         eps
     );
 
-    return cudaGetLastError();
+    return cudaPeekAtLastError();
 }
 
 cudaError_t rmsnorm_backward_cuda(
@@ -339,21 +427,81 @@ cudaError_t rmsnorm_backward_cuda(
     float eps,
     cudaStream_t stream
 ) {
-    size_t n_rows = numel / normalized_shape;
-    size_t block_size = min(normalized_shape, (size_t)256);
+    if (numel == 0) {
+        return cudaSuccess;
+    }
+    if (grad_output == nullptr || input == nullptr || weight == nullptr || grad_input == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (normalized_shape == 0 || numel % normalized_shape != 0) {
+        return cudaErrorInvalidValue;
+    }
+    if (!is_finite_scalar(eps) || eps <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
 
-    rmsnorm_backward_kernel<<<n_rows, block_size, 0, stream>>>(
+    size_t n_rows = numel / normalized_shape;
+    int block_size = launch_block_size(normalized_shape);
+    int grid_size = launch_grid_size_for_rows(n_rows);
+    if (grid_size == 0) {
+        return cudaSuccess;
+    }
+
+    float* grad_weight_accum = nullptr;
+    cudaError_t err = cudaSuccess;
+
+    if (grad_weight != nullptr) {
+        size_t grad_weight_bytes = 0;
+        if (!safe_mul_size(normalized_shape, sizeof(float), &grad_weight_bytes)) {
+            return cudaErrorInvalidValue;
+        }
+        err = cudaMalloc(&grad_weight_accum, grad_weight_bytes);
+        if (err != cudaSuccess) {
+            return err;
+        }
+        err = cudaMemsetAsync(grad_weight_accum, 0, grad_weight_bytes, stream);
+        if (err != cudaSuccess) {
+            cudaError_t free_err = free_if_needed(grad_weight_accum);
+            return free_err != cudaSuccess ? free_err : err;
+        }
+    }
+
+    rmsnorm_backward_kernel<<<grid_size, block_size, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(grad_output),
         static_cast<const __nv_bfloat16*>(input),
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<__nv_bfloat16*>(grad_input),
-        static_cast<__nv_bfloat16*>(grad_weight),
+        grad_weight_accum,
         n_rows,
         normalized_shape,
         eps
     );
 
-    return cudaGetLastError();
+    err = cudaPeekAtLastError();
+    if (err != cudaSuccess) {
+        cudaError_t free_err = free_if_needed(grad_weight_accum);
+        return free_err != cudaSuccess ? free_err : err;
+    }
+
+    if (grad_weight != nullptr) {
+        int gw_block_size = launch_block_size(normalized_shape);
+        int gw_grid_size = launch_grid_size_for_numel(normalized_shape, gw_block_size);
+        float_to_bf16_kernel<<<gw_grid_size, gw_block_size, 0, stream>>>(
+            grad_weight_accum,
+            static_cast<__nv_bfloat16*>(grad_weight),
+            normalized_shape
+        );
+        err = cudaPeekAtLastError();
+        cudaError_t free_err = free_if_needed(grad_weight_accum);
+        if (err != cudaSuccess) {
+            return err;
+        }
+        if (free_err != cudaSuccess) {
+            return free_err;
+        }
+    }
+
+    return cudaSuccess;
 }
 
 cudaError_t layernorm_forward_cuda(
@@ -366,10 +514,27 @@ cudaError_t layernorm_forward_cuda(
     float eps,
     cudaStream_t stream
 ) {
-    size_t n_rows = numel / normalized_shape;
-    size_t block_size = min(normalized_shape, (size_t)256);
+    if (numel == 0) {
+        return cudaSuccess;
+    }
+    if (input == nullptr || weight == nullptr || output == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (normalized_shape == 0 || numel % normalized_shape != 0) {
+        return cudaErrorInvalidValue;
+    }
+    if (!is_finite_scalar(eps) || eps <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
 
-    layernorm_forward_kernel<<<n_rows, block_size, 0, stream>>>(
+    size_t n_rows = numel / normalized_shape;
+    int block_size = launch_block_size(normalized_shape);
+    int grid_size = launch_grid_size_for_rows(n_rows);
+    if (grid_size == 0) {
+        return cudaSuccess;
+    }
+
+    layernorm_forward_kernel<<<grid_size, block_size, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input),
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<const __nv_bfloat16*>(bias),
@@ -379,7 +544,7 @@ cudaError_t layernorm_forward_cuda(
         eps
     );
 
-    return cudaGetLastError();
+    return cudaPeekAtLastError();
 }
 
 cudaError_t gelu_forward_cuda(
@@ -389,17 +554,27 @@ cudaError_t gelu_forward_cuda(
     bool approximate,
     cudaStream_t stream
 ) {
-    size_t block_size = 256;
-    size_t num_blocks = (numel + block_size - 1) / block_size;
+    if (numel == 0) {
+        return cudaSuccess;
+    }
+    if (input == nullptr || output == nullptr) {
+        return cudaErrorInvalidValue;
+    }
 
-    gelu_forward_kernel<<<num_blocks, block_size, 0, stream>>>(
+    int block_size = kBlockSize;
+    int grid_size = launch_grid_size_for_numel(numel, block_size);
+    if (grid_size == 0) {
+        return cudaSuccess;
+    }
+
+    gelu_forward_kernel<<<grid_size, block_size, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input),
         static_cast<__nv_bfloat16*>(output),
         numel,
         approximate
     );
 
-    return cudaGetLastError();
+    return cudaPeekAtLastError();
 }
 
 cudaError_t gelu_backward_cuda(
@@ -410,10 +585,20 @@ cudaError_t gelu_backward_cuda(
     bool approximate,
     cudaStream_t stream
 ) {
-    size_t block_size = 256;
-    size_t num_blocks = (numel + block_size - 1) / block_size;
+    if (numel == 0) {
+        return cudaSuccess;
+    }
+    if (grad_output == nullptr || input == nullptr || grad_input == nullptr) {
+        return cudaErrorInvalidValue;
+    }
 
-    gelu_backward_kernel<<<num_blocks, block_size, 0, stream>>>(
+    int block_size = kBlockSize;
+    int grid_size = launch_grid_size_for_numel(numel, block_size);
+    if (grid_size == 0) {
+        return cudaSuccess;
+    }
+
+    gelu_backward_kernel<<<grid_size, block_size, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(grad_output),
         static_cast<const __nv_bfloat16*>(input),
         static_cast<__nv_bfloat16*>(grad_input),
@@ -421,7 +606,7 @@ cudaError_t gelu_backward_cuda(
         approximate
     );
 
-    return cudaGetLastError();
+    return cudaPeekAtLastError();
 }
 
 cudaError_t softmax_forward_cuda(
@@ -432,10 +617,32 @@ cudaError_t softmax_forward_cuda(
     size_t inner_size,
     cudaStream_t stream
 ) {
-    size_t num_blocks = outer_size * inner_size;
-    size_t block_size = min(dim_size, (size_t)256);
+    if (outer_size == 0 || dim_size == 0 || inner_size == 0) {
+        return cudaSuccess;
+    }
+    if (input == nullptr || output == nullptr) {
+        return cudaErrorInvalidValue;
+    }
 
-    softmax_forward_kernel<<<num_blocks, block_size, 0, stream>>>(
+    size_t rows = 0;
+    size_t tmp = 0;
+    if (!safe_mul_size(outer_size, inner_size, &rows)) {
+        return cudaErrorInvalidValue;
+    }
+    if (!safe_mul_size(dim_size, inner_size, &tmp)) {
+        return cudaErrorInvalidValue;
+    }
+    if (!safe_mul_size(outer_size, tmp, &tmp)) {
+        return cudaErrorInvalidValue;
+    }
+
+    int block_size = launch_block_size(dim_size);
+    int grid_size = launch_grid_size_for_rows(rows);
+    if (grid_size == 0) {
+        return cudaSuccess;
+    }
+
+    softmax_forward_kernel<<<grid_size, block_size, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input),
         static_cast<__nv_bfloat16*>(output),
         outer_size,
@@ -443,7 +650,7 @@ cudaError_t softmax_forward_cuda(
         inner_size
     );
 
-    return cudaGetLastError();
+    return cudaPeekAtLastError();
 }
 
-} // extern "C"
+}
