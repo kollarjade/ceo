@@ -1,20 +1,14 @@
 const std = @import("std");
 
-/// Memory layout for tensors
 pub const Layout = enum(u8) {
     row_major = 0,
     column_major = 1,
-    /// Row-major with 32-byte aligned rows
     row_major_aligned = 2,
-    /// Column-major with 32-byte aligned columns
     column_major_aligned = 3,
-    /// NC/NC layout for convolutions (NCHW/NHWC)
     nchw = 4,
     nhwc = 5,
-    /// Tensor memory layout for tensor cores
     tensor_core_32x32 = 6,
     tensor_core_16x16 = 7,
-    /// Strided layout (custom strides)
     strided = 8,
 
     pub fn isAligned(self: Layout) bool {
@@ -39,21 +33,14 @@ pub const Layout = enum(u8) {
     }
 };
 
-/// Tensor operation layout preferences
 pub const OpLayout = enum(u8) {
-    /// Keep as-is
     preserve,
-    /// Prefer row-major for this operation
     prefer_row_major,
-    /// Prefer column-major for this operation
     prefer_column_major,
-    /// Prefer NHWC for convolution-style ops
     prefer_nhwc,
-    /// Prefer tensor-core optimized layout
     prefer_tensor_core,
 };
 
-/// Padding strategy for memory alignment
 pub const PaddingStrategy = struct {
     alignment: usize,
     pad_to_multiple: usize,
@@ -66,8 +53,10 @@ pub const PaddingStrategy = struct {
     }
 
     pub fn paddedSize(self: PaddingStrategy, size: usize) usize {
-        const aligned = (size + self.alignment - 1) / self.alignment * self.alignment;
-        return (aligned + self.pad_to_multiple - 1) / self.pad_to_multiple * self.pad_to_multiple;
+        const align_val = if (self.alignment == 0) 1 else self.alignment;
+        const mult_val = if (self.pad_to_multiple == 0) 1 else self.pad_to_multiple;
+        const aligned = (size + align_val - 1) / align_val * align_val;
+        return (aligned + mult_val - 1) / mult_val * mult_val;
     }
 
     pub fn default() PaddingStrategy {
@@ -85,19 +74,17 @@ pub const PaddingStrategy = struct {
     }
 };
 
-/// Compute padded dimension for tensor cores
 pub fn padDimension(dim: usize, multiple: usize) usize {
+    if (multiple == 0) return dim;
     return (dim + multiple - 1) / multiple * multiple;
 }
 
-/// Get optimal leading dimension for GEMM
 pub fn optimalLeadingDimension(dim: usize, dtype_size: usize) usize {
-    // Round up to next multiple of 128 bytes / dtype_size
-    const elements_per_128_bytes = 128 / dtype_size;
+    if (dtype_size == 0) return dim;
+    const elements_per_128_bytes = if (dtype_size > 128) 1 else 128 / dtype_size;
     return (dim + elements_per_128_bytes - 1) / elements_per_128_bytes * elements_per_128_bytes;
 }
 
-/// Tensor core tile sizes for SM100
 pub const TensorCoreTiles = struct {
     pub const M: usize = 128;
     pub const N: usize = 128;
@@ -112,7 +99,6 @@ pub const TensorCoreTiles = struct {
     pub const is_valid_k = (K % WGMMA_K == 0);
 };
 
-/// Memory pool for efficient tensor allocation
 pub const MemoryPool = struct {
     const Block = struct {
         ptr: [*]u8,
@@ -121,39 +107,135 @@ pub const MemoryPool = struct {
     };
 
     blocks: std.ArrayList(Block),
+    buffers: std.ArrayList([]align(128) u8),
     total_size: usize,
     used_size: usize,
     device_id: i32,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, initial_size: usize, device_id: i32) !MemoryPool {
-        _ = initial_size;
-        return .{
+        var pool = MemoryPool{
             .blocks = std.ArrayList(Block).init(allocator),
+            .buffers = std.ArrayList([]align(128) u8).init(allocator),
             .total_size = 0,
             .used_size = 0,
             .device_id = device_id,
             .allocator = allocator,
         };
+
+        if (initial_size > 0) {
+            const aligned_initial = (initial_size + 127) & ~@as(usize, 127);
+            const buf = try allocator.alignedAlloc(u8, 128, aligned_initial);
+            try pool.buffers.append(buf);
+            try pool.blocks.append(.{
+                .ptr = buf.ptr,
+                .size = aligned_initial,
+                .in_use = false,
+            });
+            pool.total_size = aligned_initial;
+        }
+
+        return pool;
     }
 
     pub fn deinit(self: *MemoryPool) void {
+        for (self.buffers.items) |buf| {
+            self.allocator.free(buf);
+        }
+        self.buffers.deinit();
         self.blocks.deinit();
     }
 
     pub fn allocate(self: *MemoryPool, size: usize) ![*]u8 {
-        _ = self;
-        _ = size;
-        return error.NotImplemented;
+        if (size == 0) return error.InvalidSize;
+        const aligned_size = (size + 127) & ~@as(usize, 127);
+
+        var best_idx: ?usize = null;
+        var best_size: usize = std.math.maxInt(usize);
+
+        for (self.blocks.items, 0..) |block, i| {
+            if (!block.in_use and block.size >= aligned_size) {
+                if (block.size < best_size) {
+                    best_size = block.size;
+                    best_idx = i;
+                }
+            }
+        }
+
+        if (best_idx) |idx| {
+            const block = &self.blocks.items[idx];
+            if (block.size > aligned_size) {
+                const remaining_size = block.size - aligned_size;
+                const new_ptr = block.ptr + aligned_size;
+                block.size = aligned_size;
+                block.in_use = true;
+                try self.blocks.insert(idx + 1, .{
+                    .ptr = new_ptr,
+                    .size = remaining_size,
+                    .in_use = false,
+                });
+            } else {
+                block.in_use = true;
+            }
+            self.used_size += aligned_size;
+            return self.blocks.items[idx].ptr;
+        }
+
+        const min_alloc = 16 * 1024 * 1024;
+        const alloc_size = if (aligned_size > min_alloc) aligned_size else min_alloc;
+        const buf = try self.allocator.alignedAlloc(u8, 128, alloc_size);
+        try self.buffers.append(buf);
+        self.total_size += alloc_size;
+
+        if (alloc_size > aligned_size) {
+            try self.blocks.append(.{
+                .ptr = buf.ptr,
+                .size = aligned_size,
+                .in_use = true,
+            });
+            try self.blocks.append(.{
+                .ptr = buf.ptr + aligned_size,
+                .size = alloc_size - aligned_size,
+                .in_use = false,
+            });
+        } else {
+            try self.blocks.append(.{
+                .ptr = buf.ptr,
+                .size = alloc_size,
+                .in_use = true,
+            });
+        }
+        self.used_size += aligned_size;
+        return buf.ptr;
     }
 
     pub fn free(self: *MemoryPool, ptr: [*]u8) void {
-        _ = ptr;
-        _ = self;
+        for (self.blocks.items) |*block| {
+            if (block.ptr == ptr) {
+                if (block.in_use) {
+                    block.in_use = false;
+                    self.used_size -= block.size;
+                }
+                return;
+            }
+        }
     }
 
     pub fn defragment(self: *MemoryPool) !void {
-        _ = self;
+        if (self.blocks.items.len <= 1) return;
+
+        var i: usize = 0;
+        while (i < self.blocks.items.len - 1) {
+            const current = self.blocks.items[i];
+            const next = self.blocks.items[i + 1];
+
+            if (!current.in_use and !next.in_use and @intFromPtr(current.ptr) + current.size == @intFromPtr(next.ptr)) {
+                self.blocks.items[i].size += next.size;
+                _ = self.blocks.orderedRemove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
     }
 };
 
@@ -167,4 +249,17 @@ test "padDimension" {
     try std.testing.expectEqual(@as(usize, 128), padDimension(100, 128));
     try std.testing.expectEqual(@as(usize, 128), padDimension(128, 128));
     try std.testing.expectEqual(@as(usize, 256), padDimension(129, 128));
+}
+
+test "MemoryPool basic operations" {
+    var pool = try MemoryPool.init(std.testing.allocator, 1024, 0);
+    defer pool.deinit();
+
+    const ptr1 = try pool.allocate(100);
+    const ptr2 = try pool.allocate(200);
+    
+    pool.free(ptr1);
+    pool.free(ptr2);
+    
+    try pool.defragment();
 }
