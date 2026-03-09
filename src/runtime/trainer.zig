@@ -1,487 +1,380 @@
 const std = @import("std");
-const cuda_mod = @import("cuda.zig");
-const nccl_mod = @import("nccl.zig");
-const config = @import("../util/config.zig");
+const config_mod = @import("../util/config.zig");
+const runtime_mod = @import("main.zig");
+const telemetry_mod = @import("../telemetry/main.zig");
+const tensor_mod = @import("../tensor/tensor.zig");
+const optim_mod = @import("../optim/optimizer.zig");
+const nn_mod = @import("../nn/layers.zig");
+const model_mod = @import("../model/model.zig");
+const data_mod = @import("../data/dataset.zig");
+const checkpoint_mod = @import("../checkpoint/manager.zig");
+const dtype_mod = @import("../tensor/dtype.zig");
 
-pub const cuda = cuda_mod;
-pub const nccl = nccl_mod;
+pub const Config = config_mod.Config;
+pub const DistributedRuntime = runtime_mod.DistributedRuntime;
+pub const Telemetry = telemetry_mod.Telemetry;
+pub const Tensor = tensor_mod.Tensor;
+pub const Shape = tensor_mod.Shape;
+pub const BF16 = dtype_mod.BF16;
 
-pub const ProcessGroup = struct {
-    rank: usize,
-    world_size: usize,
-    device_id: usize,
-    nccl_group: ?*nccl_mod.NcclGroup,
-    stream: *cuda_mod.CudaStream,
-    collectives: ?nccl_mod.NcclCollectives,
+pub const Trainer = struct {
+    config: Config,
+    runtime: *DistributedRuntime,
+    telemetry: *Telemetry,
+    model: *model_mod.EflaModel,
+    optimizer: *optim_mod.LionMuonOptimizer,
+    scheduler: optim_mod.LRScheduler,
+    clipper: optim_mod.GradientClipper,
+    checkpoint_manager: checkpoint_mod.CheckpointManager,
+    step: usize,
+    epoch: usize,
+    tokens_seen: usize,
+    best_loss: f32,
     allocator: std.mem.Allocator,
-    owns_stream: bool,
+    rng: std.Random.DefaultPrng,
+    cached_params: ?[]*Tensor,
+    cached_grads: ?[]*Tensor,
+    cached_param_names: ?[][]const u8,
+
+    const Self = @This();
 
     pub fn init(
         allocator: std.mem.Allocator,
-        rank: usize,
-        world_size: usize,
-        device_id: usize,
-        stream: *cuda_mod.CudaStream,
-    ) !ProcessGroup {
-        var nccl_group: ?*nccl_mod.NcclGroup = null;
-        var collectives: ?nccl_mod.NcclCollectives = null;
+        cfg: Config,
+        runtime: *DistributedRuntime,
+        telemetry: *Telemetry,
+    ) !Self {
+        var prng = std.Random.DefaultPrng.init(cfg.runtime.seed);
 
-        if (world_size > 1) {
-            nccl_group = try allocator.create(nccl_mod.NcclGroup);
-            errdefer allocator.destroy(nccl_group.?);
-            nccl_group.?.* = try nccl_mod.NcclGroup.initAllDevices(allocator, world_size);
-            collectives = nccl_mod.NcclCollectives.init(nccl_group.?, stream.stream);
-        }
+        var model = try model_mod.EflaModel.init(
+            allocator,
+            cfg.model,
+            .cuda,
+            @intCast(runtime.rank),
+            &prng,
+        );
+        errdefer model.deinit();
 
-        return .{
-            .rank = rank,
-            .world_size = world_size,
-            .device_id = device_id,
-            .nccl_group = nccl_group,
-            .stream = stream,
-            .collectives = collectives,
-            .allocator = allocator,
-            .owns_stream = false,
-        };
-    }
+        const params = try model.collectParameters(allocator);
+        errdefer allocator.free(params);
 
-    pub fn deinit(self: *ProcessGroup) void {
-        if (self.nccl_group) |g| {
-            g.deinit();
-            self.allocator.destroy(g);
-        }
-    }
+        var optimizer = try optim_mod.LionMuonOptimizer.init(
+            allocator,
+            params,
+            cfg.training.learning_rate,
+            cfg.training.lion_beta1,
+            cfg.training.lion_beta2,
+            cfg.training.muon_momentum,
+            cfg.training.muon_iterations,
+            cfg.training.weight_decay,
+            .cuda,
+            @intCast(runtime.rank),
+        );
+        errdefer optimizer.deinit();
 
-    pub fn allReduce(
-        self: *ProcessGroup,
-        sendbuf: *const anyopaque,
-        recvbuf: *anyopaque,
-        count: usize,
-        dtype: nccl_mod.NcclDataType,
-        op: nccl_mod.NcclRedOp,
-    ) !void {
-        if (self.world_size == 1) {
-            const elem_size: usize = switch (dtype) {
-                .int8, .uint8 => 1,
-                .fp16, .bf16 => 2,
-                .int32, .uint32, .fp32 => 4,
-                .int64, .uint64, .fp64 => 8,
-            };
-            const size = count * elem_size;
-            const dst_ptr = @as([*]u8, @ptrCast(recvbuf));
-            const src_ptr = @as([*]const u8, @ptrCast(sendbuf));
-            if (dst_ptr != src_ptr) {
-                @memcpy(dst_ptr[0..size], src_ptr[0..size]);
-            }
-            return;
-        }
+        const scheduler = optim_mod.LRScheduler.init(
+            cfg.training.learning_rate,
+            cfg.training.min_learning_rate,
+            cfg.training.warmup_steps,
+            cfg.training.total_steps,
+            .linear_warmup_cosine,
+        );
 
-        if (self.collectives) |*c| {
-            try c.allReduce(sendbuf, recvbuf, count, dtype, op, self.rank);
-        }
-    }
+        const clipper = optim_mod.GradientClipper.init(
+            cfg.training.gradient_clip,
+            .norm,
+        );
 
-    pub fn allGather(
-        self: *ProcessGroup,
-        sendbuf: *const anyopaque,
-        recvbuf: *anyopaque,
-        sendcount: usize,
-        dtype: nccl_mod.NcclDataType,
-    ) !void {
-        if (self.world_size == 1) {
-            const elem_size: usize = switch (dtype) {
-                .int8, .uint8 => 1,
-                .fp16, .bf16 => 2,
-                .int32, .uint32, .fp32 => 4,
-                .int64, .uint64, .fp64 => 8,
-            };
-            const size = sendcount * elem_size;
-            const dst_ptr = @as([*]u8, @ptrCast(recvbuf));
-            const src_ptr = @as([*]const u8, @ptrCast(sendbuf));
-            if (dst_ptr != src_ptr) {
-                @memcpy(dst_ptr[0..size], src_ptr[0..size]);
-            }
-            return;
-        }
-
-        if (self.collectives) |*c| {
-            try c.allGather(sendbuf, recvbuf, sendcount, dtype, self.rank);
-        }
-    }
-
-    pub fn reduceScatter(
-        self: *ProcessGroup,
-        sendbuf: *const anyopaque,
-        recvbuf: *anyopaque,
-        recvcount: usize,
-        dtype: nccl_mod.NcclDataType,
-        op: nccl_mod.NcclRedOp,
-    ) !void {
-        if (self.world_size == 1) {
-            const elem_size: usize = switch (dtype) {
-                .int8, .uint8 => 1,
-                .fp16, .bf16 => 2,
-                .int32, .uint32, .fp32 => 4,
-                .int64, .uint64, .fp64 => 8,
-            };
-            const size = recvcount * elem_size;
-            const dst_ptr = @as([*]u8, @ptrCast(recvbuf));
-            const src_ptr = @as([*]const u8, @ptrCast(sendbuf));
-            if (dst_ptr != src_ptr) {
-                @memcpy(dst_ptr[0..size], src_ptr[0..size]);
-            }
-            return;
-        }
-
-        if (self.collectives) |*c| {
-            try c.reduceScatter(sendbuf, recvbuf, recvcount, dtype, op, self.rank);
-        }
-    }
-
-    pub fn broadcast(
-        self: *ProcessGroup,
-        sendbuf: *const anyopaque,
-        recvbuf: *anyopaque,
-        count: usize,
-        dtype: nccl_mod.NcclDataType,
-        root: usize,
-    ) !void {
-        if (self.world_size == 1) {
-            const elem_size: usize = switch (dtype) {
-                .int8, .uint8 => 1,
-                .fp16, .bf16 => 2,
-                .int32, .uint32, .fp32 => 4,
-                .int64, .uint64, .fp64 => 8,
-            };
-            const size = count * elem_size;
-            const dst_ptr = @as([*]u8, @ptrCast(recvbuf));
-            const src_ptr = @as([*]const u8, @ptrCast(sendbuf));
-            if (dst_ptr != src_ptr) {
-                @memcpy(dst_ptr[0..size], src_ptr[0..size]);
-            }
-            return;
-        }
-
-        if (self.collectives) |*c| {
-            try c.broadcast(sendbuf, recvbuf, count, dtype, @intCast(root), self.rank);
-        }
-    }
-
-    pub fn barrier(self: *ProcessGroup) !void {
-        if (self.world_size == 1) return;
-        var send_dummy: f32 = 0;
-        var recv_dummy: f32 = 0;
-        try self.allReduce(@ptrCast(&send_dummy), @ptrCast(&recv_dummy), 1, .fp32, .sum);
-        try self.stream.synchronize();
-    }
-};
-
-pub const DistributedRuntime = struct {
-    rank: usize,
-    world_size: usize,
-    device_ids: []usize,
-    process_groups: []*ProcessGroup,
-    streams: []*cuda_mod.CudaStream,
-    devices: []cuda_mod.CudaDevice,
-    allocator: std.mem.Allocator,
-    initialized: bool,
-
-    pub fn initSingleGPU(allocator: std.mem.Allocator) !DistributedRuntime {
-        var cuda_init = try cuda_mod.CudaInit.init(allocator);
-        defer cuda_init.deinit();
-
-        if (cuda_init.device_count == 0) {
-            return error.NoGpuAvailable;
-        }
-
-        const device_id: usize = 0;
-
-        var device_ids = try allocator.alloc(usize, 1);
-        errdefer allocator.free(device_ids);
-        device_ids[0] = device_id;
-
-        var devices = try allocator.alloc(cuda_mod.CudaDevice, 1);
-        errdefer allocator.free(devices);
-        devices[0] = try cuda_mod.CudaDevice.init(0);
-
-        var stream = try allocator.create(cuda_mod.CudaStream);
-        errdefer allocator.destroy(stream);
-        stream.* = try cuda_mod.CudaStream.init(@intCast(device_id));
-
-        var streams = try allocator.alloc(*cuda_mod.CudaStream, 1);
-        errdefer allocator.free(streams);
-        streams[0] = stream;
-
-        var pg = try allocator.create(ProcessGroup);
-        errdefer allocator.destroy(pg);
-        pg.* = try ProcessGroup.init(allocator, 0, 1, device_id, stream);
-
-        var pgs = try allocator.alloc(*ProcessGroup, 1);
-        errdefer allocator.free(pgs);
-        pgs[0] = pg;
+        var checkpoint_manager = try checkpoint_mod.CheckpointManager.init(
+            allocator,
+            cfg.checkpoint.dir,
+            cfg.checkpoint.keep_last_n,
+            cfg.checkpoint.compression,
+        );
+        errdefer checkpoint_manager.deinit();
 
         return .{
-            .rank = 0,
-            .world_size = 1,
-            .device_ids = device_ids,
-            .process_groups = pgs,
-            .streams = streams,
-            .devices = devices,
+            .config = cfg,
+            .runtime = runtime,
+            .telemetry = telemetry,
+            .model = model,
+            .optimizer = optimizer,
+            .scheduler = scheduler,
+            .clipper = clipper,
+            .checkpoint_manager = checkpoint_manager,
+            .step = 0,
+            .epoch = 0,
+            .tokens_seen = 0,
+            .best_loss = std.math.inf(f32),
             .allocator = allocator,
-            .initialized = true,
+            .rng = prng,
+            .cached_params = params,
+            .cached_grads = null,
+            .cached_param_names = null,
         };
     }
 
-    pub fn init(allocator: std.mem.Allocator, cfg: config.RuntimeConfig) !DistributedRuntime {
-        var cuda_init = try cuda_mod.CudaInit.init(allocator);
-        defer cuda_init.deinit();
-
-        const world_size = cfg.world_size;
-        if (world_size == 0) {
-            return error.InvalidWorldSize;
+    pub fn deinit(self: *Self) void {
+        if (self.cached_params) |p| {
+            self.allocator.free(p);
         }
-
-        if (@as(usize, cuda_init.device_count) < world_size) {
-            std.log.warn("Requested {d} GPUs but only {d} available", .{ world_size, cuda_init.device_count });
-            return error.NotEnoughGpus;
+        if (self.cached_grads) |g| {
+            self.allocator.free(g);
         }
-
-        var device_ids = try allocator.alloc(usize, world_size);
-        errdefer allocator.free(device_ids);
-
-        var devices = try allocator.alloc(cuda_mod.CudaDevice, world_size);
-        errdefer allocator.free(devices);
-
-        var streams = try allocator.alloc(*cuda_mod.CudaStream, world_size);
-        errdefer {
-            for (streams[0..world_size]) |s| {
-                s.deinit() catch {};
-                allocator.destroy(s);
-            }
-            allocator.free(streams);
+        if (self.cached_param_names) |names| {
+            for (names) |n| self.allocator.free(n);
+            self.allocator.free(names);
         }
-
-        var pgs = try allocator.alloc(*ProcessGroup, world_size);
-        errdefer {
-            for (pgs[0..world_size]) |p| {
-                p.deinit();
-                allocator.destroy(p);
-            }
-            allocator.free(pgs);
-        }
-
-        var created_streams: usize = 0;
-        var created_pgs: usize = 0;
-
-        errdefer {
-            for (0..created_pgs) |i| {
-                pgs[i].deinit();
-                allocator.destroy(pgs[i]);
-            }
-            for (0..created_streams) |i| {
-                streams[i].deinit() catch {};
-                allocator.destroy(streams[i]);
-            }
-        }
-
-        for (0..world_size) |i| {
-            device_ids[i] = i;
-            devices[i] = try cuda_mod.CudaDevice.init(@intCast(i));
-
-            const s = try allocator.create(cuda_mod.CudaStream);
-            s.* = try cuda_mod.CudaStream.init(@intCast(i));
-            streams[i] = s;
-            created_streams += 1;
-
-            const p = try allocator.create(ProcessGroup);
-            p.* = try ProcessGroup.init(allocator, i, world_size, i, s);
-            pgs[i] = p;
-            created_pgs += 1;
-        }
-
-        return .{
-            .rank = cfg.rank,
-            .world_size = world_size,
-            .device_ids = device_ids,
-            .process_groups = pgs,
-            .streams = streams,
-            .devices = devices,
-            .allocator = allocator,
-            .initialized = true,
-        };
+        self.model.deinit();
+        self.optimizer.deinit();
+        self.checkpoint_manager.deinit();
     }
 
-    pub fn deinit(self: *DistributedRuntime) void {
-        if (!self.initialized) return;
+    pub fn run(self: *Self, data_path: ?[]const u8) !void {
+        const path = data_path orelse self.config.data.path;
 
-        for (self.process_groups) |pg| {
-            pg.deinit();
-            self.allocator.destroy(pg);
-        }
-        self.allocator.free(self.process_groups);
+        std.log.info("Starting training from step {d}", .{self.step});
+        std.log.info("Training data: {s}", .{path});
 
-        for (self.streams) |stream| {
-            stream.deinit() catch {};
-            self.allocator.destroy(stream);
-        }
-        self.allocator.free(self.streams);
+        var dataset = try data_mod.BinaryDataset.open(self.allocator, path);
+        defer dataset.close();
 
-        self.allocator.free(self.devices);
-        self.allocator.free(self.device_ids);
+        std.log.info("Dataset contains {d} tokens", .{dataset.num_tokens});
 
-        self.initialized = false;
-    }
+        var loader = try data_mod.DataLoader.init(
+            self.allocator,
+            &dataset,
+            self.config.training.micro_batch_size,
+            self.config.data.seq_len,
+            true,
+            self.config.runtime.seed,
+        );
+        defer loader.deinit();
 
-    pub fn getProcessGroup(self: *DistributedRuntime, rank: usize) ?*ProcessGroup {
-        if (rank >= self.process_groups.len) return null;
-        return self.process_groups[rank];
-    }
+        std.log.info("Created data loader with {d} batches", .{loader.numBatches()});
 
-    pub fn currentProcessGroup(self: *DistributedRuntime) *ProcessGroup {
-        return self.process_groups[self.rank];
-    }
+        const start_time = std.time.milliTimestamp();
 
-    pub fn getStream(self: *DistributedRuntime, rank: usize) ?*cuda_mod.CudaStream {
-        if (rank >= self.streams.len) return null;
-        return self.streams[rank];
-    }
+        while (self.step < self.config.training.total_steps) {
+            if (try loader.next()) |batch| {
+                defer batch.deinit(self.allocator);
 
-    pub fn currentStream(self: *DistributedRuntime) *cuda_mod.CudaStream {
-        return self.streams[self.rank];
-    }
+                const loss = try self.trainStep(&batch);
 
-    pub fn synchronize(self: *DistributedRuntime) !void {
-        for (self.streams) |stream| {
-            try stream.synchronize();
-        }
-    }
+                self.step += 1;
+                self.tokens_seen += batch.batch_size * batch.seq_len;
 
-    pub fn getMemoryInfo(self: *DistributedRuntime) ![]struct { free: usize, total: usize } {
-        var info = try self.allocator.alloc(struct { free: usize, total: usize }, self.world_size);
-        errdefer self.allocator.free(info);
+                if (loss < self.best_loss) {
+                    self.best_loss = loss;
+                }
 
-        for (0..self.world_size) |i| {
-            try cuda_mod.checkCudaError(cuda_mod.cuda_set_device(@intCast(i)));
-            info[i] = try cuda_mod.getMemoryInfo();
-        }
+                if (self.step % self.config.telemetry.metrics_interval == 0) {
+                    const elapsed_ms = std.time.milliTimestamp() - start_time;
+                    const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+                    const tput = if (elapsed_s > 0.0)
+                        @as(f64, @floatFromInt(self.tokens_seen)) / elapsed_s
+                    else
+                        0.0;
+                    try self.logMetrics(loss, tput);
+                }
 
-        return info;
-    }
-
-    pub fn freeMemoryInfo(self: *DistributedRuntime, info: []struct { free: usize, total: usize }) void {
-        self.allocator.free(info);
-    }
-
-    pub fn allBlackwell(self: *DistributedRuntime) bool {
-        for (self.devices) |*device| {
-            if (!device.isBlackwell()) return false;
-        }
-        return true;
-    }
-
-    pub fn enablePeerAccess(self: *DistributedRuntime) !void {
-        for (0..self.world_size) |i| {
-            for (i + 1..self.world_size) |j| {
-                try cuda_mod.enablePeerAccess(@intCast(i), @intCast(j));
+                if (self.step % self.config.checkpoint.save_interval == 0) {
+                    try self.saveCheckpoint();
+                }
+            } else {
+                loader.reset();
+                self.epoch += 1;
+                std.log.info("Starting epoch {d}", .{self.epoch});
             }
         }
+
+        std.log.info("Training completed at step {d}", .{self.step});
     }
-};
 
-pub const Topology = struct {
-    numa_nodes: []NumaNode,
-    gpu_affinity: []GpuAffinity,
-    allocator: std.mem.Allocator,
+    fn trainStep(self: *Self, batch: *const data_mod.Batch) !f32 {
+        const loss = try self.forwardStep(batch);
 
-    pub const NumaNode = struct {
-        id: usize,
-        cpus: []usize,
-        gpus: []usize,
-        memory_size: usize,
-    };
+        try self.backwardStep();
 
-    pub const GpuAffinity = struct {
-        gpu_id: usize,
-        numa_node: usize,
-        pci_bus: u32,
-        pci_device: u32,
-    };
+        const grads = try self.model.collectGradients(self.allocator);
+        defer self.allocator.free(grads);
 
-    pub fn detect(allocator: std.mem.Allocator, num_gpus: usize) !Topology {
-        var cpus = try allocator.dupe(usize, &[_]usize{0});
-        errdefer allocator.free(cpus);
+        const grad_norm = try self.clipper.clip(grads);
 
-        var gpus = try allocator.alloc(usize, num_gpus);
-        errdefer allocator.free(gpus);
+        const lr = self.scheduler.getLR();
+        self.optimizer.setLR(lr);
 
-        for (0..num_gpus) |i| {
-            gpus[i] = i;
-        }
+        try self.optimizer.step(grads);
 
-        var numa_nodes = try allocator.alloc(NumaNode, 1);
-        errdefer allocator.free(numa_nodes);
+        self.scheduler.step();
 
-        numa_nodes[0] = .{
-            .id = 0,
-            .cpus = cpus,
-            .gpus = gpus,
-            .memory_size = 0,
+        const now = std.time.timestamp();
+        const elapsed_s = if (self.step > 0)
+            @as(f64, @floatFromInt(self.tokens_seen)) / @as(f64, @floatFromInt(now))
+        else
+            0.0;
+
+        try self.telemetry.logStep(.{
+            .step = self.step,
+            .tokens = self.tokens_seen,
+            .loss = loss,
+            .lr = lr,
+            .grad_norm = grad_norm,
+            .throughput = elapsed_s,
+            .memory_used = 0,
+            .memory_total = 0,
+            .timestamp = now,
+        });
+
+        return loss;
+    }
+
+    pub fn smokeTest(self: *Self) !void {
+        std.log.info("Running smoke test...", .{});
+
+        const batch_size = 1;
+        const seq_len = 16;
+
+        var input_tokens = try self.allocator.alloc(u32, batch_size * seq_len);
+        defer self.allocator.free(input_tokens);
+        @memset(input_tokens, 1);
+
+        var target_tokens = try self.allocator.alloc(u32, batch_size * seq_len);
+        defer self.allocator.free(target_tokens);
+        @memset(target_tokens, 2);
+
+        const batch = data_mod.Batch{
+            .input = input_tokens,
+            .target = target_tokens,
+            .batch_size = batch_size,
+            .seq_len = seq_len,
         };
 
-        var gpu_affinity = try allocator.alloc(GpuAffinity, num_gpus);
-        errdefer allocator.free(gpu_affinity);
-
-        for (0..num_gpus) |i| {
-            gpu_affinity[i] = .{
-                .gpu_id = i,
-                .numa_node = 0,
-                .pci_bus = @intCast(i),
-                .pci_device = 0,
-            };
+        for (0..3) |i| {
+            const loss = try self.trainStep(&batch);
+            std.log.info("Smoke test iteration {d}: loss = {d:.4}", .{ i, loss });
         }
 
-        return .{
-            .numa_nodes = numa_nodes,
-            .gpu_affinity = gpu_affinity,
-            .allocator = allocator,
+        std.log.info("Smoke test passed!", .{});
+    }
+
+    pub fn resume(self: *Self, checkpoint_path: []const u8) !void {
+        std.log.info("Resuming from checkpoint: {s}", .{checkpoint_path});
+
+        const params = try self.model.collectParameters(self.allocator);
+        defer self.allocator.free(params);
+
+        const names = try self.model.getParameterNames(self.allocator);
+        defer {
+            for (names) |n| self.allocator.free(n);
+            self.allocator.free(names);
+        }
+
+        const metadata = try self.checkpoint_manager.load(
+            checkpoint_path,
+            params,
+            names,
+        );
+
+        self.step = metadata.step;
+        self.epoch = metadata.epoch;
+        self.tokens_seen = metadata.tokens_seen;
+        self.best_loss = metadata.loss;
+
+        std.log.info("Resumed from step {d}, epoch {d}", .{ self.step, self.epoch });
+    }
+
+    fn forwardStep(self: *Self, batch: *const data_mod.Batch) !f32 {
+        const input_shape = Shape.init(&[_]usize{ batch.batch_size, batch.seq_len });
+
+        var input_tensor = try Tensor.init(
+            self.allocator,
+            input_shape,
+            .uint32,
+            .cuda,
+            @intCast(self.runtime.rank),
+        );
+        defer input_tensor.deinit();
+
+        const input_ptr = input_tensor.typedPtr(u32) orelse return error.InvalidDType;
+        @memcpy(input_ptr[0..batch.input.len], batch.input);
+
+        const target_shape = Shape.init(&[_]usize{ batch.batch_size, batch.seq_len });
+        var target_tensor = try Tensor.init(
+            self.allocator,
+            target_shape,
+            .uint32,
+            .cuda,
+            @intCast(self.runtime.rank),
+        );
+        defer target_tensor.deinit();
+
+        const target_ptr = target_tensor.typedPtr(u32) orelse return error.InvalidDType;
+        @memcpy(target_ptr[0..batch.target.len], batch.target);
+
+        const output = try self.model.forward(input_tensor);
+        defer output.deinit();
+
+        const loss = try self.model.computeLoss(output, target_tensor);
+
+        return loss;
+    }
+
+    fn backwardStep(self: *Self) !void {
+        try self.model.backward();
+    }
+
+    fn logMetrics(self: *Self, loss: f32, throughput: f64) !void {
+        const lr = self.scheduler.getLR();
+
+        std.log.info(
+            "step={d} loss={d:.4} lr={d:.2e} tokens={d} throughput={d:.1} tok/s",
+            .{ self.step, loss, lr, self.tokens_seen, throughput },
+        );
+
+        try self.telemetry.logMetrics(.{
+            .step = self.step,
+            .loss = loss,
+            .lr = lr,
+            .tokens = self.tokens_seen,
+            .throughput = throughput,
+            .grad_norm = 0.0,
+            .memory_used = 0,
+            .memory_total = 0,
+            .timestamp = std.time.timestamp(),
+        });
+    }
+
+    fn saveCheckpoint(self: *Self) !void {
+        const metadata = checkpoint_mod.CheckpointMetadata{
+            .step = self.step,
+            .epoch = self.epoch,
+            .tokens_seen = self.tokens_seen,
+            .loss = self.best_loss,
+            .learning_rate = self.scheduler.getLR(),
+            .timestamp = std.time.timestamp(),
+            .git_revision = [_]u8{0} ** 40,
+            .config_hash = [_]u8{0} ** 32,
         };
-    }
 
-    pub fn deinit(self: *Topology) void {
-        for (self.numa_nodes) |node| {
-            self.allocator.free(node.cpus);
-            self.allocator.free(node.gpus);
-        }
-        self.allocator.free(self.numa_nodes);
-        self.allocator.free(self.gpu_affinity);
-    }
+        const params = try self.model.collectParameters(self.allocator);
+        defer self.allocator.free(params);
 
-    pub fn getGpuForNuma(self: *Topology, numa_node: usize) ?usize {
-        for (self.gpu_affinity) |affinity| {
-            if (affinity.numa_node == numa_node) {
-                return affinity.gpu_id;
-            }
-        }
-        return null;
-    }
-
-    pub fn getAllGpusForNuma(self: *Topology, numa_node: usize, allocator: std.mem.Allocator) ![]usize {
-        var count: usize = 0;
-        for (self.gpu_affinity) |affinity| {
-            if (affinity.numa_node == numa_node) {
-                count += 1;
-            }
+        const names = try self.model.getParameterNames(self.allocator);
+        defer {
+            for (names) |n| self.allocator.free(n);
+            self.allocator.free(names);
         }
 
-        var result = try allocator.alloc(usize, count);
-        var idx: usize = 0;
-        for (self.gpu_affinity) |affinity| {
-            if (affinity.numa_node == numa_node) {
-                result[idx] = affinity.gpu_id;
-                idx += 1;
-            }
-        }
+        _ = try self.checkpoint_manager.save(
+            self.step,
+            params,
+            names,
+            null,
+            null,
+            metadata,
+        );
 
-        return result;
+        std.log.info("Saved checkpoint at step {d}", .{self.step});
     }
 };
