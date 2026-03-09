@@ -1,21 +1,34 @@
 const std = @import("std");
-const cli = @import("util/cli.zig");
 const config = @import("util/config.zig");
 const runtime = @import("runtime/main.zig");
 const trainer = @import("runtime/trainer.zig");
 const tokenizer_mod = @import("data/tokenizer.zig");
-const dataset = @import("data/dataset.zig");
 const checkpoint = @import("checkpoint/manager.zig");
 const evaluator = @import("eval/evaluator.zig");
 const telemetry = @import("telemetry/main.zig");
+const builtin = @import("builtin");
 
 pub const std_options = std.Options{
     .logFn = telemetry.logFn,
 };
 
+const Command = enum {
+    train,
+    evaluate,
+    generate,
+    @"smoke-test",
+    checkpoint,
+    tokenizer,
+    validate,
+    profile,
+    version,
+    help,
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{
-        .thread_safe = true,
+        .enable_memory_limit = true,
+        .enable_thread_safety = true,
     }){};
     defer _ = gpa.deinit();
 
@@ -50,19 +63,6 @@ pub fn main() !void {
         .help => try printUsage(),
     }
 }
-
-const Command = enum {
-    train,
-    evaluate,
-    generate,
-    @"smoke-test",
-    checkpoint,
-    tokenizer,
-    validate,
-    profile,
-    version,
-    help,
-};
 
 fn printUsage() !void {
     const stdout = std.io.getStdOut().writer();
@@ -100,7 +100,9 @@ fn printVersion() !void {
     try stdout.print("Target: NVIDIA Blackwell SM100 (8×B200)\n", .{});
 }
 
-const builtin = @import("builtin");
+fn allocCheckpointConfigPath(allocator: std.mem.Allocator, checkpoint_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/config.yaml", .{checkpoint_path});
+}
 
 fn runTrain(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     var config_path: ?[]const u8 = null;
@@ -167,19 +169,23 @@ fn runEvaluate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
         } else if (std.mem.eql(u8, arg, "--max-tokens")) {
             const max_str = args.next() orelse return error.MissingMaxTokens;
             max_tokens = try std.fmt.parseInt(usize, max_str, 10);
+        } else {
+            std.log.err("Unknown argument: {s}", .{arg});
+            return error.InvalidArgument;
         }
     }
 
     const ckpt_path = checkpoint_path orelse return error.MissingCheckpoint;
     const data = data_path orelse return error.MissingDataPath;
 
-    const cfg_path_alloc = try std.fmt.allocPrint(allocator, "{s}/config.yaml", .{ckpt_path});
-    defer allocator.free(cfg_path_alloc);
-
-    var cfg: config.Config = if (config_path) |path|
-        try config.Config.parseFromFile(allocator, path)
-    else
-        try config.Config.parseFromFile(allocator, cfg_path_alloc);
+    var cfg = blk: {
+        if (config_path) |path| {
+            break :blk try config.Config.parseFromFile(allocator, path);
+        }
+        const resolved_path = try allocCheckpointConfigPath(allocator, ckpt_path);
+        defer allocator.free(resolved_path);
+        break :blk try config.Config.parseFromFile(allocator, resolved_path);
+    };
     defer cfg.deinit(allocator);
 
     var eval = try evaluator.Evaluator.init(allocator, cfg, ckpt_path);
@@ -216,37 +222,50 @@ fn runGenerate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
             top_p = try std.fmt.parseFloat(f32, top_p_str);
         } else if (std.mem.eql(u8, arg, "--config")) {
             config_path = args.next() orelse return error.MissingConfigPath;
+        } else {
+            std.log.err("Unknown argument: {s}", .{arg});
+            return error.InvalidArgument;
         }
     }
 
     const ckpt_path = checkpoint_path orelse return error.MissingCheckpoint;
     const prompt_text = prompt orelse "";
 
-    const cfg_path_alloc = try std.fmt.allocPrint(allocator, "{s}/config.yaml", .{ckpt_path});
-    defer allocator.free(cfg_path_alloc);
-
-    var cfg: config.Config = if (config_path) |path|
-        try config.Config.parseFromFile(allocator, path)
-    else
-        try config.Config.parseFromFile(allocator, cfg_path_alloc);
+    var cfg = blk: {
+        if (config_path) |path| {
+            break :blk try config.Config.parseFromFile(allocator, path);
+        }
+        const resolved_path = try allocCheckpointConfigPath(allocator, ckpt_path);
+        defer allocator.free(resolved_path);
+        break :blk try config.Config.parseFromFile(allocator, resolved_path);
+    };
     defer cfg.deinit(allocator);
 
     var gen = try evaluator.Generator.init(allocator, cfg, ckpt_path);
     defer gen.deinit();
 
     const output = try gen.generate(prompt_text, max_new_tokens, temperature, top_p);
-    defer allocator.free(output);
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("{s}\n", .{output});
 }
 
 fn runSmokeTest(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
-    _ = args;
+    var config_path: ?[]const u8 = null;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--config")) {
+            config_path = args.next() orelse return error.MissingConfigPath;
+        } else {
+            std.log.err("Unknown argument: {s}", .{arg});
+            return error.InvalidArgument;
+        }
+    }
 
     std.log.info("Running smoke test...", .{});
 
-    var cfg = try config.Config.parseFromFile(allocator, "configs/smoke.yaml");
+    const cfg_path = config_path orelse "configs/smoke.yaml";
+    var cfg = try config.Config.parseFromFile(allocator, cfg_path);
     defer cfg.deinit(allocator);
 
     var gpu_check = try runtime.cuda.initCUDA();
@@ -282,6 +301,9 @@ fn runCheckpoint(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--dir")) {
                 dir_path = args.next() orelse return error.MissingDirPath;
+            } else {
+                std.log.err("Unknown argument: {s}", .{arg});
+                return error.InvalidArgument;
             }
         }
 
@@ -293,6 +315,9 @@ fn runCheckpoint(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--path")) {
                 ckpt_path = args.next() orelse return error.MissingCheckpointPath;
+            } else {
+                std.log.err("Unknown argument: {s}", .{arg});
+                return error.InvalidArgument;
             }
         }
 
@@ -311,6 +336,9 @@ fn runCheckpoint(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !
             } else if (std.mem.eql(u8, arg, "--format")) {
                 const format_str = args.next() orelse return error.MissingFormat;
                 format = std.meta.stringToEnum(checkpoint.CheckpointFormat, format_str) orelse return error.InvalidFormat;
+            } else {
+                std.log.err("Unknown argument: {s}", .{arg});
+                return error.InvalidArgument;
             }
         }
 
@@ -344,6 +372,9 @@ fn runTokenizer(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !v
             } else if (std.mem.eql(u8, arg, "--type")) {
                 const type_str = args.next() orelse return error.MissingType;
                 model_type = std.meta.stringToEnum(tokenizer_mod.TokenizerType, type_str) orelse return error.InvalidType;
+            } else {
+                std.log.err("Unknown argument: {s}", .{arg});
+                return error.InvalidArgument;
             }
         }
 
@@ -370,7 +401,14 @@ fn runTokenizer(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !v
                 input_file = args.next() orelse return error.MissingInputFile;
             } else if (std.mem.eql(u8, arg, "--output")) {
                 output_file = args.next() orelse return error.MissingOutputFile;
+            } else {
+                std.log.err("Unknown argument: {s}", .{arg});
+                return error.InvalidArgument;
             }
+        }
+
+        if (input_text != null and input_file != null) {
+            return error.InvalidArgument;
         }
 
         const tok_path = tokenizer_path orelse return error.MissingTokenizer;
@@ -389,33 +427,49 @@ fn runTokenizer(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !v
                 try stdout.print("{d} ", .{t});
             }
             try stdout.print("\n", .{});
+        } else {
+            return error.MissingInput;
         }
     } else if (std.mem.eql(u8, subcommand, "decode")) {
         var tokenizer_path: ?[]const u8 = null;
-        var tokens: ?[]const u32 = null;
+        var token_storage: ?[]u32 = null;
+        defer {
+            if (token_storage) |tokens| {
+                allocator.free(tokens);
+            }
+        }
 
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--tokenizer")) {
                 tokenizer_path = args.next() orelse return error.MissingTokenizerPath;
             } else if (std.mem.eql(u8, arg, "--tokens")) {
+                if (token_storage) |tokens| {
+                    allocator.free(tokens);
+                    token_storage = null;
+                }
+
                 const tokens_str = args.next() orelse return error.MissingTokens;
                 var list = std.ArrayList(u32).init(allocator);
                 defer list.deinit();
 
                 var iter = std.mem.splitScalar(u8, tokens_str, ',');
-                while (iter.next()) |t| {
-                    const trimmed = std.mem.trim(u8, t, " \t\n");
-                    if (trimmed.len > 0) {
-                        try list.append(try std.fmt.parseInt(u32, trimmed, 10));
+                while (iter.next()) |item| {
+                    const trimmed = std.mem.trim(u8, item, " \t\r\n");
+                    if (trimmed.len == 0) {
+                        continue;
                     }
+                    try list.append(try std.fmt.parseInt(u32, trimmed, 10));
                 }
-                tokens = try list.toOwnedSlice();
+
+                token_storage = try list.toOwnedSlice();
+            } else {
+                std.log.err("Unknown argument: {s}", .{arg});
+                return error.InvalidArgument;
             }
         }
 
         const tok_path = tokenizer_path orelse return error.MissingTokenizer;
-        const token_list = tokens orelse return error.MissingTokens;
-        defer allocator.free(token_list);
+        const token_list = token_storage orelse return error.MissingTokens;
 
         var tok = try tokenizer_mod.Tokenizer.load(allocator, tok_path);
         defer tok.deinit();
@@ -437,6 +491,9 @@ fn runValidate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--config")) {
             config_path = args.next() orelse return error.MissingConfigPath;
+        } else {
+            std.log.err("Unknown argument: {s}", .{arg});
+            return error.InvalidArgument;
         }
     }
 
@@ -450,7 +507,9 @@ fn runValidate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
     try cfg.training.validate();
 
     const mem_estimate = try cfg.model.estimateMemory();
-    std.log.info("Estimated memory per GPU: {d:.2} GB", .{@as(f64, @floatFromInt(mem_estimate)) / (1024.0 * 1024.0 * 1024.0)});
+    std.log.info("Estimated memory per GPU: {d:.2} GB", .{
+        @as(f64, @floatFromInt(mem_estimate)) / (1024.0 * 1024.0 * 1024.0),
+    });
 
     const param_count = try cfg.model.countParameters();
     std.log.info("Total parameters: {d}", .{param_count});
@@ -468,7 +527,11 @@ fn runValidate(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !vo
 
 fn runProfile(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     _ = allocator;
-    _ = args;
+
+    while (args.next()) |arg| {
+        std.log.err("Unknown argument: {s}", .{arg});
+        return error.InvalidArgument;
+    }
 
     std.log.err("Profiling requires Nsight Systems or Compute to be installed.", .{});
     std.log.info("Use: nsys profile efla-train train --config ...", .{});
