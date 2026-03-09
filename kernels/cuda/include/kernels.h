@@ -1,109 +1,139 @@
-/**
- * EFLA Trainer - CUDA Kernel Header
- * SM100-optimized kernels for ultra-long context training
- */
-
 #ifndef EFLA_KERNELS_H
 #define EFLA_KERNELS_H
 
+#include <stddef.h>
+#include <stdint.h>
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
 #include <cuda_runtime.h>
-#include <cstdint>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Error handling
-#define CUDA_CHECK(call) \
+typedef enum efla_dtype_t {
+    EFLA_DTYPE_INVALID = 0,
+    EFLA_DTYPE_FLOAT16 = 1,
+    EFLA_DTYPE_BFLOAT16 = 2,
+    EFLA_DTYPE_FLOAT32 = 3,
+    EFLA_DTYPE_FLOAT64 = 4,
+    EFLA_DTYPE_INT32 = 5,
+    EFLA_DTYPE_INT64 = 6,
+    EFLA_DTYPE_UINT8 = 7,
+    EFLA_DTYPE_INT8 = 8
+} efla_dtype_t;
+
+typedef enum efla_fp8_format_t {
+    EFLA_FP8_FORMAT_INVALID = 0,
+    EFLA_FP8_FORMAT_E4M3 = 1,
+    EFLA_FP8_FORMAT_E5M2 = 2
+} efla_fp8_format_t;
+
+typedef enum efla_reduction_t {
+    EFLA_REDUCTION_INVALID = 0,
+    EFLA_REDUCTION_NONE = 1,
+    EFLA_REDUCTION_SUM = 2,
+    EFLA_REDUCTION_MEAN = 3
+} efla_reduction_t;
+
+typedef enum efla_norm_kind_t {
+    EFLA_NORM_KIND_INVALID = 0,
+    EFLA_NORM_KIND_L1 = 1,
+    EFLA_NORM_KIND_L2 = 2,
+    EFLA_NORM_KIND_INF = 3
+} efla_norm_kind_t;
+
+typedef enum efla_memory_kind_t {
+    EFLA_MEMORY_KIND_INVALID = 0,
+    EFLA_MEMORY_KIND_HOST = 1,
+    EFLA_MEMORY_KIND_DEVICE = 2,
+    EFLA_MEMORY_KIND_MANAGED = 3
+} efla_memory_kind_t;
+
+#define EFLA_CUDA_RETURN_IF_ERROR(call) \
     do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            return err; \
+        cudaError_t efla_cuda_status__ = (call); \
+        if (efla_cuda_status__ != cudaSuccess) { \
+            return efla_cuda_status__; \
         } \
-    } while(0)
+    } while (0)
 
-// ============================================================================
-// EFLA Kernels
-// ============================================================================
+#define EFLA_CUDA_GOTO_IF_ERROR(call, status_var, label) \
+    do { \
+        cudaError_t efla_cuda_status__ = (call); \
+        if (efla_cuda_status__ != cudaSuccess) { \
+            (status_var) = efla_cuda_status__; \
+            goto label; \
+        } \
+    } while (0)
 
-/**
- * EFLA forward pass - Exact closed-form state update
- *
- * Implements: S_t = (I - c_t * k_t * k_t^T) * S_{t-1} + c_t * k_t * v_t^T
- * With coefficient: c_t = (1 - exp(-beta * lambda)) / lambda
- */
 cudaError_t efla_forward_cuda(
-    const void* k,          // Keys: (batch, seq_len, num_heads, head_dim)
-    const void* v,          // Values: (batch, seq_len, num_heads, head_dim)
-    void* state,            // State: (num_heads, head_dim, head_dim)
-    void* output,           // Output: (batch, seq_len, num_heads, head_dim)
+    const void* k,
+    const void* v,
+    const void* initial_state,
+    void* final_state,
+    void* output,
     size_t batch_size,
     size_t seq_len,
     size_t num_heads,
     size_t head_dim,
+    efla_dtype_t tensor_dtype,
     float beta,
+    float lambda,
     size_t chunk_size,
     cudaStream_t stream
 );
 
-/**
- * EFLA backward pass
- */
 cudaError_t efla_backward_cuda(
     const void* grad_output,
     const void* k,
     const void* v,
-    const void* state,
+    const void* initial_state,
+    const void* final_state,
     void* grad_k,
     void* grad_v,
-    void* grad_state,
+    void* grad_initial_state,
     size_t batch_size,
     size_t seq_len,
     size_t num_heads,
     size_t head_dim,
+    efla_dtype_t tensor_dtype,
     float beta,
+    float lambda,
+    size_t chunk_size,
     cudaStream_t stream
 );
 
-/**
- * Chunked scan for parallel EFLA processing
- */
 cudaError_t efla_chunked_scan_cuda(
-    void** chunk_states,
+    void* const* chunk_states,
     size_t num_chunks,
+    size_t batch_size,
     size_t num_heads,
     size_t head_dim,
+    efla_dtype_t state_dtype,
     cudaStream_t stream
 );
 
-// ============================================================================
-// PRISM Kernels
-// ============================================================================
-
-/**
- * PRISM forward pass - Iterative rank accumulation with write-forget decoupling
- */
 cudaError_t prism_forward_cuda(
-    const void* u,          // Proxy: (batch, seq_len, hidden_dim)
-    const void* v,          // Values: (batch, seq_len, hidden_dim)
+    const void* u,
+    const void* v,
     const void* prev_state,
     void* new_state,
     void* output,
-    const void** w_beta,    // Weights per iteration
-    const void** w_k,
-    const void** w_p,
+    const void* const* w_beta,
+    const void* const* w_k,
+    const void* const* w_p,
     size_t batch_size,
     size_t seq_len,
     size_t hidden_dim,
     size_t head_dim,
     size_t num_iterations,
+    efla_dtype_t tensor_dtype,
     float alpha,
     cudaStream_t stream
 );
 
-/**
- * ShortConv forward - Causal convolution
- */
 cudaError_t shortconv_forward_cuda(
     const void* input,
     const void* weight,
@@ -112,29 +142,21 @@ cudaError_t shortconv_forward_cuda(
     size_t seq_len,
     size_t hidden_dim,
     size_t window_size,
+    efla_dtype_t tensor_dtype,
     cudaStream_t stream
 );
 
-// ============================================================================
-// Normalization Kernels
-// ============================================================================
-
-/**
- * RMSNorm forward
- */
 cudaError_t rmsnorm_forward_cuda(
     const void* input,
     const void* weight,
     void* output,
     size_t numel,
     size_t normalized_shape,
+    efla_dtype_t tensor_dtype,
     float eps,
     cudaStream_t stream
 );
 
-/**
- * RMSNorm backward
- */
 cudaError_t rmsnorm_backward_cuda(
     const void* grad_output,
     const void* input,
@@ -143,13 +165,12 @@ cudaError_t rmsnorm_backward_cuda(
     void* grad_weight,
     size_t numel,
     size_t normalized_shape,
+    efla_dtype_t tensor_dtype,
+    efla_dtype_t grad_weight_dtype,
     float eps,
     cudaStream_t stream
 );
 
-/**
- * LayerNorm forward
- */
 cudaError_t layernorm_forward_cuda(
     const void* input,
     const void* weight,
@@ -157,57 +178,40 @@ cudaError_t layernorm_forward_cuda(
     void* output,
     size_t numel,
     size_t normalized_shape,
+    efla_dtype_t tensor_dtype,
     float eps,
     cudaStream_t stream
 );
 
-// ============================================================================
-// Activation Kernels
-// ============================================================================
-
-/**
- * GELU forward
- */
 cudaError_t gelu_forward_cuda(
     const void* input,
     void* output,
     size_t numel,
+    efla_dtype_t tensor_dtype,
     bool approximate,
     cudaStream_t stream
 );
 
-/**
- * GELU backward
- */
 cudaError_t gelu_backward_cuda(
     const void* grad_output,
     const void* input,
     void* grad_input,
     size_t numel,
+    efla_dtype_t tensor_dtype,
     bool approximate,
     cudaStream_t stream
 );
 
-/**
- * Softmax forward
- */
 cudaError_t softmax_forward_cuda(
     const void* input,
     void* output,
     size_t outer_size,
     size_t dim_size,
     size_t inner_size,
+    efla_dtype_t tensor_dtype,
     cudaStream_t stream
 );
 
-// ============================================================================
-// GEMM Kernels (SM100 Tensor Core Optimized)
-// ============================================================================
-
-/**
- * GEMM forward - General matrix multiply with optional bias
- * C = A @ B + bias
- */
 cudaError_t gemm_forward_cuda(
     const void* a,
     const void* b,
@@ -216,15 +220,12 @@ cudaError_t gemm_forward_cuda(
     size_t m,
     size_t k,
     size_t n,
-    int dtype_a,
-    int dtype_b,
-    int dtype_c,
+    efla_dtype_t dtype_a,
+    efla_dtype_t dtype_b,
+    efla_dtype_t dtype_c,
     cudaStream_t stream
 );
 
-/**
- * GEMM backward
- */
 cudaError_t gemm_backward_cuda(
     const void* grad_c,
     const void* a,
@@ -235,29 +236,28 @@ cudaError_t gemm_backward_cuda(
     size_t m,
     size_t k,
     size_t n,
+    efla_dtype_t grad_c_dtype,
+    efla_dtype_t a_dtype,
+    efla_dtype_t b_dtype,
+    efla_dtype_t grad_a_dtype,
+    efla_dtype_t grad_b_dtype,
+    efla_dtype_t grad_bias_dtype,
     cudaStream_t stream
 );
 
-// ============================================================================
-// Loss Kernels
-// ============================================================================
-
-/**
- * Cross entropy loss forward
- */
 cudaError_t cross_entropy_forward_cuda(
-    const void* logits,     // (batch, vocab_size)
-    const int32_t* targets, // (batch,)
-    void* loss,             // scalar or (batch,)
+    const void* logits,
+    const int32_t* targets,
+    void* loss,
     size_t batch_size,
     size_t vocab_size,
+    efla_dtype_t logits_dtype,
+    efla_dtype_t loss_dtype,
     float label_smoothing,
+    efla_reduction_t reduction,
     cudaStream_t stream
 );
 
-/**
- * Cross entropy loss backward
- */
 cudaError_t cross_entropy_backward_cuda(
     const void* grad_loss,
     const void* logits,
@@ -265,22 +265,20 @@ cudaError_t cross_entropy_backward_cuda(
     void* grad_logits,
     size_t batch_size,
     size_t vocab_size,
+    efla_dtype_t grad_loss_dtype,
+    efla_dtype_t logits_dtype,
+    efla_dtype_t grad_logits_dtype,
     float label_smoothing,
+    efla_reduction_t reduction,
     cudaStream_t stream
 );
 
-// ============================================================================
-// Optimizer Kernels
-// ============================================================================
-
-/**
- * Lion optimizer step
- */
 cudaError_t lion_step_cuda(
     void* param,
     const void* grad,
     void* momentum,
     size_t numel,
+    efla_dtype_t tensor_dtype,
     float lr,
     float beta1,
     float beta2,
@@ -288,30 +286,26 @@ cudaError_t lion_step_cuda(
     cudaStream_t stream
 );
 
-/**
- * Muon optimizer step - Newton-Schulz orthogonalization
- */
 cudaError_t muon_step_cuda(
     void* param,
     const void* grad,
     void* momentum,
     size_t m,
     size_t n,
+    efla_dtype_t tensor_dtype,
     float lr,
     float beta,
     size_t ns_iterations,
     cudaStream_t stream
 );
 
-/**
- * AdamW optimizer step
- */
 cudaError_t adamw_step_cuda(
     void* param,
     const void* grad,
     void* exp_avg,
     void* exp_avg_sq,
     size_t numel,
+    efla_dtype_t tensor_dtype,
     float lr,
     float beta1,
     float beta2,
@@ -321,102 +315,81 @@ cudaError_t adamw_step_cuda(
     cudaStream_t stream
 );
 
-/**
- * Gradient clipping by norm
- */
 cudaError_t clip_grad_norm_cuda(
     void** grads,
     const size_t* numels,
     size_t num_params,
+    efla_dtype_t tensor_dtype,
     float max_norm,
     float* global_norm,
+    efla_memory_kind_t global_norm_memory_kind,
     cudaStream_t stream
 );
 
-// ============================================================================
-// Memory and Utility Kernels
-// ============================================================================
-
-/**
- * Fill tensor with value
- */
 cudaError_t fill_cuda(
     void* ptr,
     float value,
     size_t numel,
-    int dtype,
+    efla_dtype_t dtype,
     cudaStream_t stream
 );
 
-/**
- * Copy and cast between dtypes
- */
 cudaError_t cast_cuda(
     const void* src,
     void* dst,
     size_t numel,
-    int src_dtype,
-    int dst_dtype,
+    efla_dtype_t src_dtype,
+    efla_dtype_t dst_dtype,
     cudaStream_t stream
 );
 
-/**
- * Embedding lookup
- */
 cudaError_t embedding_forward_cuda(
     const int32_t* indices,
     const void* weight,
     void* output,
     size_t num_indices,
     size_t embedding_dim,
+    efla_dtype_t weight_dtype,
+    efla_dtype_t output_dtype,
     cudaStream_t stream
 );
 
-/**
- * FP8 quantization
- */
 cudaError_t quantize_fp8_cuda(
     const void* input,
     void* output,
     float* scale,
     size_t numel,
+    efla_dtype_t input_dtype,
+    efla_fp8_format_t output_format,
+    efla_memory_kind_t scale_memory_kind,
     cudaStream_t stream
 );
 
-/**
- * FP8 dequantization
- */
 cudaError_t dequantize_fp8_cuda(
     const void* input,
     void* output,
     float scale,
     size_t numel,
+    efla_fp8_format_t input_format,
+    efla_dtype_t output_dtype,
     cudaStream_t stream
 );
 
-// ============================================================================
-// Reduction Kernels
-// ============================================================================
-
-/**
- * Sum reduction
- */
 cudaError_t sum_reduce_cuda(
     const void* input,
     void* output,
     size_t numel,
-    int dtype,
+    efla_dtype_t dtype,
     cudaStream_t stream
 );
 
-/**
- * Norm computation
- */
 cudaError_t norm_cuda(
     const void* input,
     float* output,
     size_t numel,
-    int dtype,
+    efla_dtype_t dtype,
+    efla_norm_kind_t norm_kind,
+    efla_memory_kind_t output_memory_kind,
     cudaStream_t stream
 );
 
@@ -424,4 +397,4 @@ cudaError_t norm_cuda(
 }
 #endif
 
-#endif // EFLA_KERNELS_H
+#endif
