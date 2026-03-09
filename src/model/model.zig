@@ -7,8 +7,6 @@ const efla_mod = @import("efla.zig");
 const prism_mod = @import("prism.zig");
 
 pub const Tensor = tensor_mod.Tensor;
-pub const Shape = tensor_mod.Shape;
-pub const DType = dtype_mod.DType;
 pub const BF16 = dtype_mod.BF16;
 
 pub const ModelError = error{
@@ -33,16 +31,18 @@ pub const ModelForwardResult = struct {
     prism_states: []?*prism_mod.PrismState,
 
     pub fn deinit(self: *ModelForwardResult, allocator: std.mem.Allocator) void {
-        for (self.efla_states) |state_opt| {
-            if (state_opt) |state| state.deinit();
+        for (self.efla_states) |state| {
+            if (state) |s| {
+                s.deinit();
+            }
+        }
+        for (self.prism_states) |state| {
+            if (state) |s| {
+                s.deinit();
+            }
         }
         allocator.free(self.efla_states);
-
-        for (self.prism_states) |state_opt| {
-            if (state_opt) |state| state.deinit();
-        }
         allocator.free(self.prism_states);
-
         self.logits.deinit();
     }
 };
@@ -72,7 +72,7 @@ pub const TransformerBlock = struct {
         if (config.hidden_dim == 0 or config.intermediate_dim == 0 or config.num_heads == 0 or config.head_dim == 0) {
             return ModelError.InvalidConfiguration;
         }
-        if (config.hidden_dim % config.num_heads != 0) {
+        if (config.hidden_dim != config.num_heads * config.head_dim) {
             return ModelError.InvalidConfiguration;
         }
 
@@ -168,26 +168,38 @@ pub const TransformerBlock = struct {
         const normed = try self.ln1.forward(input);
         defer normed.deinit();
 
-        var efla_result = try self.efla.forward(normed, efla_state);
+        const efla_result = try self.efla.forward(normed, efla_state);
+        var efla_output: ?*Tensor = efla_result.output;
+        var new_efla_state: ?*efla_mod.EflaState = efla_result.new_state;
         errdefer {
-            efla_result.output.deinit();
-            if (efla_result.new_state) |state| {
-                state.deinit();
+            if (efla_output) |tensor| {
+                tensor.deinit();
             }
-        }
-        defer efla_result.output.deinit();
-
-        var prism_result = try self.prism.forward(normed, efla_result.output, prism_state);
-        errdefer {
-            prism_result.output.deinit();
-            if (prism_result.new_state) |state| {
-                state.deinit();
+            if (new_efla_state) |state_ptr| {
+                state_ptr.deinit();
             }
         }
 
-        const residual = try self.addTensors(input, prism_result.output);
+        const prism_result = try self.prism.forward(normed, efla_output.?, prism_state);
+        var prism_output: ?*Tensor = prism_result.output;
+        var new_prism_state: ?*prism_mod.PrismState = prism_result.new_state;
+        errdefer {
+            if (prism_output) |tensor| {
+                tensor.deinit();
+            }
+            if (new_prism_state) |state_ptr| {
+                state_ptr.deinit();
+            }
+        }
+
+        const residual = try self.addTensors(input, prism_output.?);
         errdefer residual.deinit();
-        prism_result.output.deinit();
+
+        prism_output.?.deinit();
+        prism_output = null;
+
+        efla_output.?.deinit();
+        efla_output = null;
 
         const normed2 = try self.ln2.forward(residual);
         defer normed2.deinit();
@@ -204,10 +216,15 @@ pub const TransformerBlock = struct {
         const output = try self.addTensors(residual, down);
         residual.deinit();
 
+        const returned_efla_state = new_efla_state;
+        const returned_prism_state = new_prism_state;
+        new_efla_state = null;
+        new_prism_state = null;
+
         return .{
             .output = output,
-            .new_efla_state = efla_result.new_state,
-            .new_prism_state = prism_result.new_state,
+            .new_efla_state = returned_efla_state,
+            .new_prism_state = returned_prism_state,
         };
     }
 
@@ -217,6 +234,12 @@ pub const TransformerBlock = struct {
         }
         if (tensor.device != self.device or tensor.device_id != self.device_id) {
             return ModelError.DeviceMismatch;
+        }
+        if (tensor.shape.ndim != 3) {
+            return ModelError.InvalidInputRank;
+        }
+        if (tensor.shape.dim(2) != self.config.hidden_dim) {
+            return ModelError.ShapeMismatch;
         }
         if (self.device != .cpu) {
             return ModelError.UnsupportedDevice;
@@ -231,43 +254,16 @@ pub const TransformerBlock = struct {
             return ModelError.ShapeMismatch;
         }
 
-        const a_ptr_opt = a.typedPtr(BF16);
-        const b_ptr_opt = b.typedPtr(BF16);
-        if (a_ptr_opt == null or b_ptr_opt == null) {
-            return ModelError.UnsupportedOperation;
-        }
+        const a_ptr = a.typedPtr(BF16) orelse return ModelError.UnsupportedOperation;
+        const b_ptr = b.typedPtr(BF16) orelse return ModelError.UnsupportedOperation;
 
         const output = try Tensor.init(self.allocator, a.shape, a.dtype, self.device, self.device_id);
         errdefer output.deinit();
 
-        const o_ptr_opt = output.typedPtr(BF16);
-        if (o_ptr_opt == null) {
-            return ModelError.UnsupportedOperation;
-        }
-
-        const a_ptr = a_ptr_opt.?;
-        const b_ptr = b_ptr_opt.?;
-        const o_ptr = o_ptr_opt.?;
+        const o_ptr = output.typedPtr(BF16) orelse return ModelError.UnsupportedOperation;
         const numel = a.shape.numel();
 
-        const vec_len = 16;
-        const V = @Vector(vec_len, f32);
-        var i: usize = 0;
-
-        while (i + vec_len <= numel) : (i += vec_len) {
-            var a_vec: V = undefined;
-            var b_vec: V = undefined;
-            for (0..vec_len) |v| {
-                a_vec[v] = a_ptr[i + v].toFloat32();
-                b_vec[v] = b_ptr[i + v].toFloat32();
-            }
-            const o_vec = a_vec + b_vec;
-            for (0..vec_len) |v| {
-                o_ptr[i + v] = BF16.fromFloat32(o_vec[v]);
-            }
-        }
-
-        while (i < numel) : (i += 1) {
+        for (0..numel) |i| {
             o_ptr[i] = BF16.fromFloat32(a_ptr[i].toFloat32() + b_ptr[i].toFloat32());
         }
 
@@ -276,7 +272,8 @@ pub const TransformerBlock = struct {
 
     pub fn backward(self: *Self, grad_output: *Tensor) !*Tensor {
         _ = self;
-        return grad_output.clone();
+        _ = grad_output;
+        return ModelError.UnsupportedOperation;
     }
 };
 
@@ -284,7 +281,7 @@ pub const EflaModel = struct {
     embed_tokens: *nn_mod.Embedding,
     blocks: []*TransformerBlock,
     final_norm: *nn_mod.RMSNorm,
-    lm_head: *nn_mod.Linear,
+    lm_head: ?*nn_mod.Linear,
     config: config_mod.ModelConfig,
     allocator: std.mem.Allocator,
     device: tensor_mod.Device,
@@ -306,7 +303,7 @@ pub const EflaModel = struct {
         if (config.num_heads == 0 or config.head_dim == 0) {
             return ModelError.InvalidConfiguration;
         }
-        if (config.hidden_dim % config.num_heads != 0) {
+        if (config.hidden_dim != config.num_heads * config.head_dim) {
             return ModelError.InvalidConfiguration;
         }
 
@@ -347,16 +344,23 @@ pub const EflaModel = struct {
         const final_norm = try nn_mod.RMSNorm.init(allocator, config.hidden_dim, device, device_id);
         errdefer final_norm.deinit();
 
-        const lm_head = try nn_mod.Linear.init(
-            allocator,
-            config.hidden_dim,
-            config.vocab_size,
-            false,
-            device,
-            device_id,
-            rng,
-        );
-        errdefer lm_head.deinit();
+        var lm_head: ?*nn_mod.Linear = null;
+        if (!config.tie_embeddings) {
+            lm_head = try nn_mod.Linear.init(
+                allocator,
+                config.hidden_dim,
+                config.vocab_size,
+                false,
+                device,
+                device_id,
+                rng,
+            );
+            errdefer {
+                if (lm_head) |head| {
+                    head.deinit();
+                }
+            }
+        }
 
         self.* = .{
             .embed_tokens = embed_tokens,
@@ -380,20 +384,28 @@ pub const EflaModel = struct {
         }
         self.allocator.free(self.blocks);
         self.final_norm.deinit();
-        self.lm_head.deinit();
+        if (self.lm_head) |head| {
+            head.deinit();
+        }
         self.allocator.destroy(self);
     }
 
     pub fn forward(self: *Self, input_ids: *Tensor) !*Tensor {
         var result = try self.forwardWithStates(input_ids, null, null);
-        for (result.efla_states) |state_opt| {
-            if (state_opt) |state| state.deinit();
+
+        for (result.efla_states) |state| {
+            if (state) |s| {
+                s.deinit();
+            }
+        }
+        for (result.prism_states) |state| {
+            if (state) |s| {
+                s.deinit();
+            }
         }
         self.allocator.free(result.efla_states);
-        for (result.prism_states) |state_opt| {
-            if (state_opt) |state| state.deinit();
-        }
         self.allocator.free(result.prism_states);
+
         return result.logits;
     }
 
@@ -406,15 +418,20 @@ pub const EflaModel = struct {
         if (input_ids.device != self.device or input_ids.device_id != self.device_id) {
             return ModelError.DeviceMismatch;
         }
+        if (input_ids.shape.ndim != 2) {
+            return ModelError.InvalidInputRank;
+        }
         if (self.device != .cpu) {
             return ModelError.UnsupportedDevice;
         }
 
         const embeds = try self.embed_tokens.forward(input_ids);
-        errdefer embeds.deinit();
-
-        var hidden = embeds;
-        errdefer hidden.deinit();
+        var hidden: ?*Tensor = embeds;
+        errdefer {
+            if (hidden) |tensor| {
+                tensor.deinit();
+            }
+        }
 
         const efla_states_out = try self.allocator.alloc(?*efla_mod.EflaState, self.blocks.len);
         errdefer self.allocator.free(efla_states_out);
@@ -451,18 +468,21 @@ pub const EflaModel = struct {
             else
                 null;
 
-            const result = try block.forward(hidden, efla_state, prism_state);
-            hidden.deinit();
+            const current_hidden = hidden.?;
+            const result = try block.forward(current_hidden, efla_state, prism_state);
+            current_hidden.deinit();
             hidden = result.output;
             efla_states_out[i] = result.new_efla_state;
             prism_states_out[i] = result.new_prism_state;
         }
 
-        const normed = try self.final_norm.forward(hidden);
-        hidden.deinit();
+        const final_hidden = hidden.?;
+        const normed = try self.final_norm.forward(final_hidden);
+        final_hidden.deinit();
+        hidden = null;
         errdefer normed.deinit();
 
-        const logits = try self.lm_head.forward(normed);
+        const logits = try self.projectToVocab(normed);
         normed.deinit();
 
         return .{
@@ -474,7 +494,8 @@ pub const EflaModel = struct {
 
     pub fn backward(self: *Self, grad_output: *Tensor) !*Tensor {
         _ = self;
-        return grad_output.clone();
+        _ = grad_output;
+        return ModelError.UnsupportedOperation;
     }
 
     pub fn collectParameters(self: *Self, allocator: std.mem.Allocator) ![]*Tensor {
@@ -507,8 +528,8 @@ pub const EflaModel = struct {
         }
 
         try params.append(self.final_norm.weight);
-        if (!self.tied_embeddings) {
-            try params.append(self.lm_head.weight);
+        if (self.lm_head) |head| {
+            try params.append(head.weight);
         }
 
         return params.toOwnedSlice();
@@ -523,79 +544,43 @@ pub const EflaModel = struct {
             names.deinit();
         }
 
-        const embed_name = try allocator.dupe(u8, "embed_tokens.weight");
-        errdefer allocator.free(embed_name);
-        try names.append(embed_name);
+        try names.append(try allocator.dupe(u8, "embed_tokens.weight"));
 
         for (self.blocks, 0..) |block, i| {
-            const ln1_name = try std.fmt.allocPrint(allocator, "blocks.{d}.ln1.weight", .{i});
-            errdefer allocator.free(ln1_name);
-            try names.append(ln1_name);
-
-            const wk_name = try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_k", .{i});
-            errdefer allocator.free(wk_name);
-            try names.append(wk_name);
-
-            const wv_name = try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_v", .{i});
-            errdefer allocator.free(wv_name);
-            try names.append(wv_name);
-
-            const wo_name = try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_o", .{i});
-            errdefer allocator.free(wo_name);
-            try names.append(wo_name);
-
+            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.ln1.weight", .{i}));
+            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_k", .{i}));
+            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_v", .{i}));
+            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_o", .{i}));
             if (block.efla.beta_param != null) {
-                const beta_name = try std.fmt.allocPrint(allocator, "blocks.{d}.efla.beta_param", .{i});
-                errdefer allocator.free(beta_name);
-                try names.append(beta_name);
+                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.beta_param", .{i}));
             }
             for (0..block.prism.w_beta.len) |j| {
-                const wbeta_name = try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_beta.{d}", .{ i, j });
-                errdefer allocator.free(wbeta_name);
-                try names.append(wbeta_name);
+                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_beta.{d}", .{ i, j }));
             }
             for (0..block.prism.w_k.len) |j| {
-                const wpk_name = try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_k.{d}", .{ i, j });
-                errdefer allocator.free(wpk_name);
-                try names.append(wpk_name);
+                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_k.{d}", .{ i, j }));
             }
             for (0..block.prism.w_p.len) |j| {
-                const wpp_name = try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_p.{d}", .{ i, j });
-                errdefer allocator.free(wpp_name);
-                try names.append(wpp_name);
+                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_p.{d}", .{ i, j }));
             }
-            const sc_name = try std.fmt.allocPrint(allocator, "blocks.{d}.prism.shortconv.weight", .{i});
-            errdefer allocator.free(sc_name);
-            try names.append(sc_name);
-
-            const ln2_name = try std.fmt.allocPrint(allocator, "blocks.{d}.ln2.weight", .{i});
-            errdefer allocator.free(ln2_name);
-            try names.append(ln2_name);
-
-            const mlpup_name = try std.fmt.allocPrint(allocator, "blocks.{d}.mlp_up.weight", .{i});
-            errdefer allocator.free(mlpup_name);
-            try names.append(mlpup_name);
-
-            const mlpdown_name = try std.fmt.allocPrint(allocator, "blocks.{d}.mlp_down.weight", .{i});
-            errdefer allocator.free(mlpdown_name);
-            try names.append(mlpdown_name);
+            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.shortconv.weight", .{i}));
+            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.ln2.weight", .{i}));
+            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.mlp_up.weight", .{i}));
+            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.mlp_down.weight", .{i}));
         }
 
-        const fn_name = try allocator.dupe(u8, "final_norm.weight");
-        errdefer allocator.free(fn_name);
-        try names.append(fn_name);
-
-        if (!self.tied_embeddings) {
-            const lm_name = try allocator.dupe(u8, "lm_head.weight");
-            errdefer allocator.free(lm_name);
-            try names.append(lm_name);
+        try names.append(try allocator.dupe(u8, "final_norm.weight"));
+        if (self.lm_head != null) {
+            try names.append(try allocator.dupe(u8, "lm_head.weight"));
         }
 
         return names.toOwnedSlice();
     }
 
     pub fn collectGradients(self: *Self, allocator: std.mem.Allocator) ![]*Tensor {
-        return self.collectParameters(allocator);
+        _ = self;
+        _ = allocator;
+        return ModelError.UnsupportedOperation;
     }
 
     pub fn countParameters(self: *Self) u64 {
@@ -626,16 +611,100 @@ pub const EflaModel = struct {
         }
 
         count += tensorNumel(self.final_norm.weight);
-        if (!self.tied_embeddings) {
-            count += tensorNumel(self.lm_head.weight);
+        if (self.lm_head) |head| {
+            count += tensorNumel(head.weight);
         }
 
         return count;
     }
+
+    fn projectToVocab(self: *Self, hidden: *Tensor) !*Tensor {
+        if (!self.tied_embeddings) {
+            const head = self.lm_head orelse return ModelError.InvalidConfiguration;
+            return head.forward(hidden);
+        }
+
+        if (self.device != .cpu) {
+            return ModelError.UnsupportedDevice;
+        }
+        if (hidden.device != self.device or hidden.device_id != self.device_id) {
+            return ModelError.DeviceMismatch;
+        }
+        if (hidden.dtype != .bf16 or self.embed_tokens.weight.dtype != .bf16) {
+            return ModelError.DTypeMismatch;
+        }
+        if (hidden.shape.ndim != 2 and hidden.shape.ndim != 3) {
+            return ModelError.InvalidInputRank;
+        }
+        if (self.embed_tokens.weight.shape.ndim != 2) {
+            return ModelError.InvalidConfiguration;
+        }
+        if (hidden.shape.dim(hidden.shape.ndim - 1) != self.embed_tokens.weight.shape.dim(1)) {
+            return ModelError.ShapeMismatch;
+        }
+        if (self.embed_tokens.weight.shape.dim(0) != self.config.vocab_size) {
+            return ModelError.ShapeMismatch;
+        }
+
+        const output_shape = switch (hidden.shape.ndim) {
+            2 => tensor_mod.Shape.init(&[_]usize{ hidden.shape.dim(0), self.config.vocab_size }),
+            3 => tensor_mod.Shape.init(&[_]usize{ hidden.shape.dim(0), hidden.shape.dim(1), self.config.vocab_size }),
+            else => return ModelError.InvalidInputRank,
+        };
+
+        const output = try Tensor.init(self.allocator, output_shape, .bf16, self.device, self.device_id);
+        errdefer output.deinit();
+
+        const hidden_ptr = hidden.typedPtr(BF16) orelse return ModelError.UnsupportedOperation;
+        const weight_ptr = self.embed_tokens.weight.typedPtr(BF16) orelse return ModelError.UnsupportedOperation;
+        const output_ptr = output.typedPtr(BF16) orelse return ModelError.UnsupportedOperation;
+
+        const hidden_dim = self.config.hidden_dim;
+        const vocab_size = self.config.vocab_size;
+
+        switch (hidden.shape.ndim) {
+            2 => {
+                const rows = hidden.shape.dim(0);
+                for (0..rows) |row| {
+                    for (0..vocab_size) |vocab_idx| {
+                        var sum: f32 = 0.0;
+                        for (0..hidden_dim) |k| {
+                            const lhs = hidden_ptr[row * hidden_dim + k].toFloat32();
+                            const rhs = weight_ptr[vocab_idx * hidden_dim + k].toFloat32();
+                            sum += lhs * rhs;
+                        }
+                        output_ptr[row * vocab_size + vocab_idx] = BF16.fromFloat32(sum);
+                    }
+                }
+            },
+            3 => {
+                const batch_size = hidden.shape.dim(0);
+                const seq_len = hidden.shape.dim(1);
+                for (0..batch_size) |batch_idx| {
+                    for (0..seq_len) |token_idx| {
+                        const row_offset = (batch_idx * seq_len + token_idx) * hidden_dim;
+                        const out_offset = (batch_idx * seq_len + token_idx) * vocab_size;
+                        for (0..vocab_size) |vocab_idx| {
+                            var sum: f32 = 0.0;
+                            for (0..hidden_dim) |k| {
+                                const lhs = hidden_ptr[row_offset + k].toFloat32();
+                                const rhs = weight_ptr[vocab_idx * hidden_dim + k].toFloat32();
+                                sum += lhs * rhs;
+                            }
+                            output_ptr[out_offset + vocab_idx] = BF16.fromFloat32(sum);
+                        }
+                    }
+                }
+            },
+            else => return ModelError.InvalidInputRank,
+        }
+
+        return output;
+    }
 };
 
 fn tensorNumel(tensor: *Tensor) u64 {
-    return @as(u64, tensor.shape.numel());
+    return @intCast(tensor.shape.numel());
 }
 
 test "EflaModel parameter count matches collected parameters and names" {
@@ -674,7 +743,7 @@ test "EflaModel parameter count matches collected parameters and names" {
 
     var manual_count: u64 = 0;
     for (params) |param| {
-        manual_count += @as(u64, param.shape.numel());
+        manual_count += @intCast(param.shape.numel());
     }
 
     try std.testing.expectEqual(manual_count, model.countParameters());
