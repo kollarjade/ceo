@@ -33,8 +33,16 @@ pub const ModelForwardResult = struct {
     prism_states: []?*prism_mod.PrismState,
 
     pub fn deinit(self: *ModelForwardResult, allocator: std.mem.Allocator) void {
+        for (self.efla_states) |state_opt| {
+            if (state_opt) |state| state.deinit();
+        }
         allocator.free(self.efla_states);
+
+        for (self.prism_states) |state_opt| {
+            if (state_opt) |state| state.deinit();
+        }
         allocator.free(self.prism_states);
+
         self.logits.deinit();
     }
 };
@@ -242,7 +250,24 @@ pub const TransformerBlock = struct {
         const o_ptr = o_ptr_opt.?;
         const numel = a.shape.numel();
 
-        for (0..numel) |i| {
+        const vec_len = 16;
+        const V = @Vector(vec_len, f32);
+        var i: usize = 0;
+
+        while (i + vec_len <= numel) : (i += vec_len) {
+            var a_vec: V = undefined;
+            var b_vec: V = undefined;
+            for (0..vec_len) |v| {
+                a_vec[v] = a_ptr[i + v].toFloat32();
+                b_vec[v] = b_ptr[i + v].toFloat32();
+            }
+            const o_vec = a_vec + b_vec;
+            for (0..vec_len) |v| {
+                o_ptr[i + v] = BF16.fromFloat32(o_vec[v]);
+            }
+        }
+
+        while (i < numel) : (i += 1) {
             o_ptr[i] = BF16.fromFloat32(a_ptr[i].toFloat32() + b_ptr[i].toFloat32());
         }
 
@@ -361,8 +386,14 @@ pub const EflaModel = struct {
 
     pub fn forward(self: *Self, input_ids: *Tensor) !*Tensor {
         var result = try self.forwardWithStates(input_ids, null, null);
-        defer self.allocator.free(result.efla_states);
-        defer self.allocator.free(result.prism_states);
+        for (result.efla_states) |state_opt| {
+            if (state_opt) |state| state.deinit();
+        }
+        self.allocator.free(result.efla_states);
+        for (result.prism_states) |state_opt| {
+            if (state_opt) |state| state.deinit();
+        }
+        self.allocator.free(result.prism_states);
         return result.logits;
     }
 
@@ -429,6 +460,7 @@ pub const EflaModel = struct {
 
         const normed = try self.final_norm.forward(hidden);
         hidden.deinit();
+        errdefer normed.deinit();
 
         const logits = try self.lm_head.forward(normed);
         normed.deinit();
@@ -491,34 +523,72 @@ pub const EflaModel = struct {
             names.deinit();
         }
 
-        try names.append(try allocator.dupe(u8, "embed_tokens.weight"));
+        const embed_name = try allocator.dupe(u8, "embed_tokens.weight");
+        errdefer allocator.free(embed_name);
+        try names.append(embed_name);
 
         for (self.blocks, 0..) |block, i| {
-            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.ln1.weight", .{i}));
-            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_k", .{i}));
-            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_v", .{i}));
-            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_o", .{i}));
+            const ln1_name = try std.fmt.allocPrint(allocator, "blocks.{d}.ln1.weight", .{i});
+            errdefer allocator.free(ln1_name);
+            try names.append(ln1_name);
+
+            const wk_name = try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_k", .{i});
+            errdefer allocator.free(wk_name);
+            try names.append(wk_name);
+
+            const wv_name = try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_v", .{i});
+            errdefer allocator.free(wv_name);
+            try names.append(wv_name);
+
+            const wo_name = try std.fmt.allocPrint(allocator, "blocks.{d}.efla.w_o", .{i});
+            errdefer allocator.free(wo_name);
+            try names.append(wo_name);
+
             if (block.efla.beta_param != null) {
-                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.efla.beta_param", .{i}));
+                const beta_name = try std.fmt.allocPrint(allocator, "blocks.{d}.efla.beta_param", .{i});
+                errdefer allocator.free(beta_name);
+                try names.append(beta_name);
             }
             for (0..block.prism.w_beta.len) |j| {
-                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_beta.{d}", .{ i, j }));
+                const wbeta_name = try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_beta.{d}", .{ i, j });
+                errdefer allocator.free(wbeta_name);
+                try names.append(wbeta_name);
             }
             for (0..block.prism.w_k.len) |j| {
-                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_k.{d}", .{ i, j }));
+                const wpk_name = try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_k.{d}", .{ i, j });
+                errdefer allocator.free(wpk_name);
+                try names.append(wpk_name);
             }
             for (0..block.prism.w_p.len) |j| {
-                try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_p.{d}", .{ i, j }));
+                const wpp_name = try std.fmt.allocPrint(allocator, "blocks.{d}.prism.w_p.{d}", .{ i, j });
+                errdefer allocator.free(wpp_name);
+                try names.append(wpp_name);
             }
-            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.prism.shortconv.weight", .{i}));
-            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.ln2.weight", .{i}));
-            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.mlp_up.weight", .{i}));
-            try names.append(try std.fmt.allocPrint(allocator, "blocks.{d}.mlp_down.weight", .{i}));
+            const sc_name = try std.fmt.allocPrint(allocator, "blocks.{d}.prism.shortconv.weight", .{i});
+            errdefer allocator.free(sc_name);
+            try names.append(sc_name);
+
+            const ln2_name = try std.fmt.allocPrint(allocator, "blocks.{d}.ln2.weight", .{i});
+            errdefer allocator.free(ln2_name);
+            try names.append(ln2_name);
+
+            const mlpup_name = try std.fmt.allocPrint(allocator, "blocks.{d}.mlp_up.weight", .{i});
+            errdefer allocator.free(mlpup_name);
+            try names.append(mlpup_name);
+
+            const mlpdown_name = try std.fmt.allocPrint(allocator, "blocks.{d}.mlp_down.weight", .{i});
+            errdefer allocator.free(mlpdown_name);
+            try names.append(mlpdown_name);
         }
 
-        try names.append(try allocator.dupe(u8, "final_norm.weight"));
+        const fn_name = try allocator.dupe(u8, "final_norm.weight");
+        errdefer allocator.free(fn_name);
+        try names.append(fn_name);
+
         if (!self.tied_embeddings) {
-            try names.append(try allocator.dupe(u8, "lm_head.weight"));
+            const lm_name = try allocator.dupe(u8, "lm_head.weight");
+            errdefer allocator.free(lm_name);
+            try names.append(lm_name);
         }
 
         return names.toOwnedSlice();
