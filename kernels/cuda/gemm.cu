@@ -1,123 +1,302 @@
-/**
- * GEMM Kernels for SM100
- * Tensor Core optimized matrix multiply
- */
-
 #include "include/kernels.h"
+#include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <mma.h>
+#include <cublas_v2.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 
-using namespace nvcuda;
+namespace {
 
-// ============================================================================
-// WMMA GEMM Kernel (128x128x128 tile)
-// ============================================================================
+template <typename T>
+__device__ __forceinline__ float scalar_to_float(T v);
 
-__global__ void wmma_gemm_kernel(
-    const __nv_bfloat16* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B,
-    const __nv_bfloat16* __restrict__ bias,
-    __nv_bfloat16* __restrict__ C,
-    size_t M, size_t N, size_t K
-) {
-    // Tile dimensions
-    constexpr int WMMA_M = 16;
-    constexpr int WMMA_N = 16;
-    constexpr int WMMA_K = 16;
-
-    constexpr int TILE_M = 128;
-    constexpr int TILE_N = 128;
-    constexpr int TILE_K = 32;
-
-    // Shared memory tiles
-    __shared__ __nv_bfloat16 sA[TILE_M][TILE_K];
-    __shared__ __nv_bfloat16 sB[TILE_K][TILE_N];
-
-    // Thread indices
-    int warpM = (blockIdx.x * TILE_M + threadIdx.y * WMMA_M) / 32;
-    int warpN = blockIdx.y * TILE_N + threadIdx.z * WMMA_N;
-    int warpId = threadIdx.y * 4 + threadIdx.z;
-
-    // Accumulator
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc;
-
-    // Initialize accumulator
-    #pragma unroll
-    for (int i = 0; i < acc.num_elements; i++) {
-        acc.x[i] = 0.0f;
-    }
-
-    // Loop over K dimension
-    for (int k = 0; k < K; k += TILE_K) {
-        // Load tiles into shared memory
-        // ... cooperative loading by all threads in block
-
-        __syncthreads();
-
-        // Compute WMMA
-        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
-
-        wmma::load_matrix_sync(a_frag, &sA[threadIdx.y * WMMA_M][0], TILE_K);
-        wmma::load_matrix_sync(b_frag, &sB[0][threadIdx.z * WMMA_N], TILE_N);
-
-        wmma::mma_sync(acc, a_frag, b_frag, acc);
-
-        __syncthreads();
-    }
-
-    // Store results
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16> c_frag;
-
-    #pragma unroll
-    for (int i = 0; i < c_frag.num_elements; i++) {
-        c_frag.x[i] = __float2bfloat16(acc.x[i]);
-    }
-
-    // Add bias if present
-    if (bias) {
-        // Add bias to each row
-    }
-
-    // Store to global memory
-    wmma::store_matrix_sync(&C[warpM * N + warpN], c_frag, N, wmma::mem_row_major);
+template <>
+__device__ __forceinline__ float scalar_to_float<__half>(__half v) {
+    return __half2float(v);
 }
 
-// ============================================================================
-// Simple GEMM (for small matrices or testing)
-// ============================================================================
-
-__global__ void simple_gemm_kernel(
-    const __nv_bfloat16* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B,
-    const __nv_bfloat16* __restrict__ bias,
-    __nv_bfloat16* __restrict__ C,
-    size_t M, size_t N, size_t K
-) {
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row >= M || col >= N) return;
-
-    float sum = 0.0f;
-
-    for (size_t k = 0; k < K; ++k) {
-        float a = __bfloat162float(A[row * K + k]);
-        float b = __bfloat162float(B[k * N + col]);
-        sum += a * b;
-    }
-
-    if (bias) {
-        sum += __bfloat162float(bias[col]);
-    }
-
-    C[row * N + col] = __float2bfloat16(sum);
+template <>
+__device__ __forceinline__ float scalar_to_float<__nv_bfloat16>(__nv_bfloat16 v) {
+    return __bfloat162float(v);
 }
 
-// ============================================================================
-// Host Functions
-// ============================================================================
+template <>
+__device__ __forceinline__ float scalar_to_float<float>(float v) {
+    return v;
+}
+
+template <typename T>
+__device__ __forceinline__ T float_to_scalar(float v);
+
+template <>
+__device__ __forceinline__ __half float_to_scalar<__half>(float v) {
+    return __float2half_rn(v);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 float_to_scalar<__nv_bfloat16>(float v) {
+    return __float2bfloat16(v);
+}
+
+template <>
+__device__ __forceinline__ float float_to_scalar<float>(float v) {
+    return v;
+}
+
+template <typename T>
+__global__ void add_bias_kernel(T* c, const T* bias, size_t m, size_t n) {
+    const size_t total = m * n;
+    for (size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += static_cast<size_t>(blockDim.x) * gridDim.x) {
+        const size_t col = idx % n;
+        const float value = scalar_to_float<T>(c[idx]) + scalar_to_float<T>(bias[col]);
+        c[idx] = float_to_scalar<T>(value);
+    }
+}
+
+template <typename T>
+__global__ void column_sum_kernel(const T* x, T* y, size_t m, size_t n) {
+    for (size_t col = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         col < n;
+         col += static_cast<size_t>(blockDim.x) * gridDim.x) {
+        float sum = 0.0f;
+        for (size_t row = 0; row < m; ++row) {
+            sum += scalar_to_float<T>(x[row * n + col]);
+        }
+        y[col] = float_to_scalar<T>(sum);
+    }
+}
+
+bool safe_mul_size(size_t a, size_t b, size_t* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    if (a == 0 || b == 0) {
+        *out = 0;
+        return true;
+    }
+    if (a > std::numeric_limits<size_t>::max() / b) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+bool normalize_dtype(int dtype, cudaDataType_t* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    switch (static_cast<cudaDataType_t>(dtype)) {
+        case CUDA_R_16F:
+            *out = CUDA_R_16F;
+            return true;
+        case CUDA_R_16BF:
+            *out = CUDA_R_16BF;
+            return true;
+        case CUDA_R_32F:
+            *out = CUDA_R_32F;
+            return true;
+        default:
+            return false;
+    }
+}
+
+size_t element_size(cudaDataType_t type) {
+    switch (type) {
+        case CUDA_R_16F:
+            return sizeof(__half);
+        case CUDA_R_16BF:
+            return sizeof(__nv_bfloat16);
+        case CUDA_R_32F:
+            return sizeof(float);
+        default:
+            return 0;
+    }
+}
+
+cudaError_t cublas_status_to_cuda_error(cublasStatus_t status) {
+    switch (status) {
+        case CUBLAS_STATUS_SUCCESS:
+            return cudaSuccess;
+        case CUBLAS_STATUS_NOT_INITIALIZED:
+            return cudaErrorInitializationError;
+        case CUBLAS_STATUS_ALLOC_FAILED:
+            return cudaErrorMemoryAllocation;
+        case CUBLAS_STATUS_INVALID_VALUE:
+            return cudaErrorInvalidValue;
+        case CUBLAS_STATUS_ARCH_MISMATCH:
+            return cudaErrorInvalidDeviceFunction;
+        case CUBLAS_STATUS_MAPPING_ERROR:
+            return cudaErrorMapBufferObjectFailed;
+        case CUBLAS_STATUS_EXECUTION_FAILED:
+            return cudaErrorLaunchFailure;
+        case CUBLAS_STATUS_INTERNAL_ERROR:
+            return cudaErrorUnknown;
+        case CUBLAS_STATUS_NOT_SUPPORTED:
+            return cudaErrorNotSupported;
+        default:
+            return cudaErrorUnknown;
+    }
+}
+
+cudaError_t create_cublas_handle(cudaStream_t stream, cublasHandle_t* handle) {
+    if (handle == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    *handle = nullptr;
+    cublasStatus_t status = cublasCreate(handle);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        return cublas_status_to_cuda_error(status);
+    }
+    status = cublasSetStream(*handle, stream);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        cublasDestroy(*handle);
+        *handle = nullptr;
+        return cublas_status_to_cuda_error(status);
+    }
+    return cudaSuccess;
+}
+
+cudaError_t destroy_cublas_handle(cublasHandle_t handle) {
+    if (handle == nullptr) {
+        return cudaSuccess;
+    }
+    return cublas_status_to_cuda_error(cublasDestroy(handle));
+}
+
+cudaError_t zero_buffer_async(void* ptr, size_t elements, size_t elem_size, cudaStream_t stream) {
+    if (ptr == nullptr || elements == 0) {
+        return cudaSuccess;
+    }
+    size_t bytes = 0;
+    if (!safe_mul_size(elements, elem_size, &bytes)) {
+        return cudaErrorInvalidValue;
+    }
+    return cudaMemsetAsync(ptr, 0, bytes, stream);
+}
+
+cudaError_t gemm_row_major_ex(
+    cublasHandle_t handle,
+    cublasOperation_t op_a,
+    cublasOperation_t op_b,
+    size_t m,
+    size_t n,
+    size_t k,
+    const void* a,
+    cudaDataType_t type_a,
+    size_t lda,
+    const void* b,
+    cudaDataType_t type_b,
+    size_t ldb,
+    void* c,
+    cudaDataType_t type_c,
+    size_t ldc
+) {
+    if (handle == nullptr || a == nullptr || b == nullptr || c == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (m > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        n > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        k > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        lda > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        ldb > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        ldc > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return cudaErrorInvalidValue;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasGemmEx(
+        handle,
+        op_b,
+        op_a,
+        static_cast<int>(n),
+        static_cast<int>(m),
+        static_cast<int>(k),
+        &alpha,
+        b,
+        type_b,
+        static_cast<int>(ldb),
+        a,
+        type_a,
+        static_cast<int>(lda),
+        &beta,
+        c,
+        type_c,
+        static_cast<int>(ldc),
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    return cublas_status_to_cuda_error(status);
+}
+
+cudaError_t launch_add_bias(
+    void* c,
+    const void* bias,
+    size_t m,
+    size_t n,
+    cudaDataType_t type,
+    cudaStream_t stream
+) {
+    if (c == nullptr || bias == nullptr || m == 0 || n == 0) {
+        return cudaSuccess;
+    }
+    size_t total = 0;
+    if (!safe_mul_size(m, n, &total)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>(std::min<size_t>((total + threads - 1) / threads, 4096));
+    switch (type) {
+        case CUDA_R_16F:
+            add_bias_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<__half*>(c),
+                static_cast<const __half*>(bias),
+                m,
+                n
+            );
+            return cudaPeekAtLastError();
+        case CUDA_R_16BF:
+            add_bias_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<__nv_bfloat16*>(c),
+                static_cast<const __nv_bfloat16*>(bias),
+                m,
+                n
+            );
+            return cudaPeekAtLastError();
+        case CUDA_R_32F:
+            add_bias_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<float*>(c),
+                static_cast<const float*>(bias),
+                m,
+                n
+            );
+            return cudaPeekAtLastError();
+        default:
+            return cudaErrorInvalidValue;
+    }
+}
+
+cudaError_t launch_column_sum_bf16(
+    const __nv_bfloat16* x,
+    __nv_bfloat16* y,
+    size_t m,
+    size_t n,
+    cudaStream_t stream
+) {
+    if (x == nullptr || y == nullptr || n == 0) {
+        return cudaSuccess;
+    }
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>(std::min<size_t>((n + threads - 1) / threads, 4096));
+    column_sum_kernel<<<blocks, threads, 0, stream>>>(x, y, m, n);
+    return cudaPeekAtLastError();
+}
+
+} 
 
 extern "C" {
 
@@ -134,24 +313,88 @@ cudaError_t gemm_forward_cuda(
     int dtype_c,
     cudaStream_t stream
 ) {
-    // For now, use simple kernel
-    // Production would use cuBLAS or optimized WMMA kernel
+    if (a == nullptr || b == nullptr || c == nullptr) {
+        return cudaErrorInvalidValue;
+    }
 
-    dim3 blockDim(16, 16);
-    dim3 gridDim(
-        (n + blockDim.x - 1) / blockDim.x,
-        (m + blockDim.y - 1) / blockDim.y
+    cudaDataType_t type_a;
+    cudaDataType_t type_b;
+    cudaDataType_t type_c;
+
+    if (!normalize_dtype(dtype_a, &type_a) ||
+        !normalize_dtype(dtype_b, &type_b) ||
+        !normalize_dtype(dtype_c, &type_c)) {
+        return cudaErrorInvalidValue;
+    }
+
+    const size_t c_elem_size = element_size(type_c);
+    if (c_elem_size == 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    size_t c_elements = 0;
+    if (!safe_mul_size(m, n, &c_elements)) {
+        return cudaErrorInvalidValue;
+    }
+
+    if (m == 0 || n == 0) {
+        return cudaSuccess;
+    }
+
+    if (k == 0) {
+        cudaError_t err = zero_buffer_async(c, c_elements, c_elem_size, stream);
+        if (err != cudaSuccess) {
+            return err;
+        }
+        if (bias != nullptr) {
+            err = launch_add_bias(c, bias, m, n, type_c, stream);
+            if (err != cudaSuccess) {
+                return err;
+            }
+        }
+        return cudaSuccess;
+    }
+
+    cublasHandle_t handle = nullptr;
+    cudaError_t err = create_cublas_handle(stream, &handle);
+    if (err != cudaSuccess) {
+        return err;
+    }
+
+    err = gemm_row_major_ex(
+        handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        m,
+        n,
+        k,
+        a,
+        type_a,
+        k,
+        b,
+        type_b,
+        n,
+        c,
+        type_c,
+        n
     );
 
-    simple_gemm_kernel<<<gridDim, blockDim, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(a),
-        static_cast<const __nv_bfloat16*>(b),
-        static_cast<const __nv_bfloat16*>(bias),
-        static_cast<__nv_bfloat16*>(c),
-        m, n, k
-    );
+    cudaError_t destroy_err = destroy_cublas_handle(handle);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    if (destroy_err != cudaSuccess) {
+        return destroy_err;
+    }
 
-    return cudaGetLastError();
+    if (bias != nullptr) {
+        err = launch_add_bias(c, bias, m, n, type_c, stream);
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+
+    return cudaSuccess;
 }
 
 cudaError_t gemm_backward_cuda(
@@ -166,24 +409,142 @@ cudaError_t gemm_backward_cuda(
     size_t n,
     cudaStream_t stream
 ) {
-    // Compute gradients:
-    // grad_a = grad_c @ B^T
-    // grad_b = A^T @ grad_c
-    // grad_bias = sum(grad_c, dim=0)
+    const size_t bf16_size = sizeof(__nv_bfloat16);
 
-    // Placeholder - would use cuBLAS for efficiency
-    (void)grad_c;
-    (void)a;
-    (void)b;
-    (void)grad_a;
-    (void)grad_b;
-    (void)grad_bias;
-    (void)m;
-    (void)k;
-    (void)n;
-    (void)stream;
+    size_t grad_a_elements = 0;
+    size_t grad_b_elements = 0;
+
+    if (!safe_mul_size(m, k, &grad_a_elements) ||
+        !safe_mul_size(k, n, &grad_b_elements)) {
+        return cudaErrorInvalidValue;
+    }
+
+    const bool need_grad_a = grad_a != nullptr;
+    const bool need_grad_b = grad_b != nullptr;
+    const bool need_grad_bias = grad_bias != nullptr;
+
+    if (!need_grad_a && !need_grad_b && !need_grad_bias) {
+        return cudaSuccess;
+    }
+
+    if (need_grad_a) {
+        if (m == 0 || k == 0 || n == 0) {
+            cudaError_t err = zero_buffer_async(grad_a, grad_a_elements, bf16_size, stream);
+            if (err != cudaSuccess) {
+                return err;
+            }
+        } else if (grad_c == nullptr || b == nullptr) {
+            return cudaErrorInvalidValue;
+        }
+    }
+
+    if (need_grad_b) {
+        if (k == 0 || n == 0 || m == 0) {
+            cudaError_t err = zero_buffer_async(grad_b, grad_b_elements, bf16_size, stream);
+            if (err != cudaSuccess) {
+                return err;
+            }
+        } else if (a == nullptr || grad_c == nullptr) {
+            return cudaErrorInvalidValue;
+        }
+    }
+
+    if (need_grad_bias) {
+        if (n == 0) {
+            return cudaSuccess;
+        }
+        if (m == 0) {
+            cudaError_t err = zero_buffer_async(grad_bias, n, bf16_size, stream);
+            if (err != cudaSuccess) {
+                return err;
+            }
+        } else if (grad_c == nullptr) {
+            return cudaErrorInvalidValue;
+        }
+    }
+
+    cublasHandle_t handle = nullptr;
+    if ((need_grad_a && m != 0 && k != 0 && n != 0) ||
+        (need_grad_b && k != 0 && n != 0 && m != 0)) {
+        cudaError_t err = create_cublas_handle(stream, &handle);
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+
+    if (need_grad_a && m != 0 && k != 0 && n != 0) {
+        cudaError_t err = gemm_row_major_ex(
+            handle,
+            CUBLAS_OP_N,
+            CUBLAS_OP_T,
+            m,
+            k,
+            n,
+            grad_c,
+            CUDA_R_16BF,
+            n,
+            b,
+            CUDA_R_16BF,
+            n,
+            grad_a,
+            CUDA_R_16BF,
+            k
+        );
+        if (err != cudaSuccess) {
+            cudaError_t destroy_err = destroy_cublas_handle(handle);
+            if (destroy_err != cudaSuccess) {
+                return destroy_err;
+            }
+            return err;
+        }
+    }
+
+    if (need_grad_b && k != 0 && n != 0 && m != 0) {
+        cudaError_t err = gemm_row_major_ex(
+            handle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            k,
+            n,
+            m,
+            a,
+            CUDA_R_16BF,
+            k,
+            grad_c,
+            CUDA_R_16BF,
+            n,
+            grad_b,
+            CUDA_R_16BF,
+            n
+        );
+        if (err != cudaSuccess) {
+            cudaError_t destroy_err = destroy_cublas_handle(handle);
+            if (destroy_err != cudaSuccess) {
+                return destroy_err;
+            }
+            return err;
+        }
+    }
+
+    cudaError_t destroy_err = destroy_cublas_handle(handle);
+    if (destroy_err != cudaSuccess) {
+        return destroy_err;
+    }
+
+    if (need_grad_bias && m != 0 && n != 0) {
+        cudaError_t err = launch_column_sum_bf16(
+            static_cast<const __nv_bfloat16*>(grad_c),
+            static_cast<__nv_bfloat16*>(grad_bias),
+            m,
+            n,
+            stream
+        );
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
 
     return cudaSuccess;
 }
 
-} // extern "C"
+}
