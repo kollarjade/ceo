@@ -1,98 +1,163 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}" && pwd)"
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
 
-CUDA_PATH="${CUDA_PATH:-/usr/local/cuda}"
+resolve_path() {
+    local path="$1"
+    [[ -d "$path" ]] || fail "Directory not found: $path"
+    cd -- "$path" >/dev/null 2>&1 && pwd -P
+}
+
+find_cuda_lib_dir() {
+    local candidates=(
+        "$CUDA_PATH/lib64"
+        "$CUDA_PATH/lib/x64"
+        "$CUDA_PATH/lib"
+        "$CUDA_PATH/targets/x86_64-linux/lib"
+        "$CUDA_PATH/targets/aarch64-linux/lib"
+    )
+    local dir
+    for dir in "${candidates[@]}"; do
+        [[ -d "$dir" ]] && {
+            printf '%s\n' "$dir"
+            return 0
+        }
+    done
+    return 1
+}
+
+require_cuda_library() {
+    local stem="$1"
+    local pattern
+    for pattern in \
+        "$CUDA_LIB_DIR/lib${stem}.so" \
+        "$CUDA_LIB_DIR/lib${stem}.so."* \
+        "$CUDA_LIB_DIR/lib${stem}.a"
+    do
+        [[ -e "$pattern" ]] && return 0
+    done
+    fail "Required CUDA library not found in $CUDA_LIB_DIR: lib${stem}"
+}
+
+detect_link_flags() {
+    local src="$1"
+    LINK_FLAGS=("-lcudart")
+    if grep -Eiq '\bcublasLt\b' "$src"; then
+        require_cuda_library "cublasLt"
+        require_cuda_library "cublas"
+        LINK_FLAGS+=("-lcublasLt" "-lcublas")
+    elif grep -Eiq '\bcublas\b' "$src"; then
+        require_cuda_library "cublas"
+        LINK_FLAGS+=("-lcublas")
+    fi
+}
+
+build_kernel() {
+    local src="$1"
+    local kernel
+    local obj
+    local static_lib
+    local shared_lib
+    local tmp_obj
+    local tmp_static
+    local tmp_shared
+
+    kernel="$(basename -- "$src" .cu)"
+    obj="$BUILD_DIR/${kernel}.o"
+    static_lib="$BUILD_DIR/libcuda_${kernel}.a"
+    shared_lib="$BUILD_DIR/libcuda_${kernel}.so"
+    tmp_obj="$TEMP_DIR/${kernel}.o"
+    tmp_static="$TEMP_DIR/libcuda_${kernel}.a"
+    tmp_shared="$TEMP_DIR/libcuda_${kernel}.so"
+
+    printf 'Building %s.cu...\n' "$kernel"
+
+    detect_link_flags "$src"
+
+    "$NVCC_BIN" "${COMMON_FLAGS[@]}" -Xcompiler=-fPIC -c -o "$tmp_obj" "$src"
+    "$NVCC_BIN" -lib -o "$tmp_static" "$tmp_obj"
+    "$NVCC_BIN" -shared -o "$tmp_shared" "$tmp_obj" "-L$CUDA_LIB_DIR" "-Wl,-rpath,$CUDA_LIB_DIR" "${LINK_FLAGS[@]}"
+
+    mv -f -- "$tmp_obj" "$obj"
+    mv -f -- "$tmp_static" "$static_lib"
+    mv -f -- "$tmp_shared" "$shared_lib"
+}
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+ROOT_DIR="$SCRIPT_DIR"
+SRC_DIR="$ROOT_DIR/kernels/cuda"
+BUILD_DIR="$ROOT_DIR/build/cuda"
+INCLUDE_DIR="$SRC_DIR/include"
+
 CUDA_ARCH="${CUDA_ARCH:-sm_100}"
+[[ "$CUDA_ARCH" =~ ^sm_[0-9]+[A-Za-z0-9_]*$ ]] || fail "Invalid CUDA_ARCH value: $CUDA_ARCH"
 
-NVCC_BIN="${CUDA_PATH}/bin/nvcc"
-CUDA_INCLUDE="${CUDA_PATH}/include"
-CUDA_LIB="${CUDA_PATH}/lib64"
-
-if [ ! -x "${NVCC_BIN}" ]; then
-    echo "nvcc not found at ${NVCC_BIN}"
-    exit 1
+if [[ -n "${CUDA_PATH:-}" ]]; then
+    CUDA_PATH="$(resolve_path "$CUDA_PATH")"
+else
+    if command -v nvcc >/dev/null 2>&1; then
+        NVCC_FROM_PATH="$(command -v nvcc)"
+        NVCC_REAL="$(readlink -f -- "$NVCC_FROM_PATH" 2>/dev/null || printf '%s\n' "$NVCC_FROM_PATH")"
+        CUDA_PATH="$(cd -- "$(dirname -- "$NVCC_REAL")/.." >/dev/null 2>&1 && pwd -P)"
+    else
+        CUDA_PATH="/usr/local/cuda"
+    fi
 fi
 
-if [ ! -d "${CUDA_INCLUDE}" ]; then
-    echo "CUDA include directory not found at ${CUDA_INCLUDE}"
-    exit 1
-fi
+NVCC_BIN="$CUDA_PATH/bin/nvcc"
+[[ -x "$NVCC_BIN" ]] || fail "nvcc not found or not executable: $NVCC_BIN"
+[[ -d "$SRC_DIR" ]] || fail "Source directory not found: $SRC_DIR"
+[[ -d "$CUDA_PATH/include" ]] || fail "CUDA include directory not found: $CUDA_PATH/include"
 
-if [ ! -d "${CUDA_LIB}" ]; then
-    echo "CUDA lib directory not found at ${CUDA_LIB}"
-    exit 1
-fi
+CUDA_LIB_DIR="$(find_cuda_lib_dir)" || fail "CUDA library directory not found under: $CUDA_PATH"
+require_cuda_library "cudart"
 
-KERNEL_SRC_DIR="${PROJECT_ROOT}/kernels/cuda"
-KERNEL_INCLUDE_DIR="${KERNEL_SRC_DIR}/include"
-BUILD_DIR="${PROJECT_ROOT}/build/cuda"
-OBJ_DIR="${BUILD_DIR}/obj"
-LIB_DIR="${BUILD_DIR}/lib"
+CUDA_ARCH_DEFINE="CUDA_ARCH_$(printf '%s' "$CUDA_ARCH" | tr '[:lower:]' '[:upper:]' | tr -cd '[:alnum:]')"
 
-mkdir -p "${OBJ_DIR}"
-mkdir -p "${LIB_DIR}"
-
-NVCC_FLAGS=(
-    "-arch=${CUDA_ARCH}"
+COMMON_FLAGS=(
+    "-arch=$CUDA_ARCH"
     "-O3"
     "--use_fast_math"
-    "-DCUDA_ARCH_SM100"
+    "-D$CUDA_ARCH_DEFINE"
     "--ptxas-options=-v"
     "-lineinfo"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
     "-std=c++20"
-    "-rdc=true"
-    "-I${KERNEL_INCLUDE_DIR}"
-    "-I${CUDA_INCLUDE}"
+    "-I$CUDA_PATH/include"
 )
 
-HOST_FLAGS=(
-    "-Xcompiler"
-    "-fPIC"
-)
+if [[ -d "$INCLUDE_DIR" ]]; then
+    COMMON_FLAGS+=("-I$INCLUDE_DIR")
+fi
 
-KERNELS=(
-    "efla"
-    "prism"
-    "layernorm"
-    "gelu"
-    "softmax"
-    "gemm"
-    "embedding"
-    "cross_entropy"
-    "optim"
-    "memory"
-    "init"
-)
+KERNEL_SOURCES=()
+while IFS= read -r -d '' src; do
+    KERNEL_SOURCES+=("$src")
+done < <(find "$SRC_DIR" -maxdepth 1 -type f -name '*.cu' -print0 | sort -z)
 
-for kernel in "${KERNELS[@]}"; do
-    SRC_FILE="${KERNEL_SRC_DIR}/${kernel}.cu"
-    OBJ_FILE="${OBJ_DIR}/${kernel}.o"
-    LINK_OBJ="${OBJ_DIR}/${kernel}_dlink.o"
-    STATIC_LIB="${LIB_DIR}/libcuda_${kernel}.a"
-    SHARED_LIB="${LIB_DIR}/libcuda_${kernel}.so"
+((${#KERNEL_SOURCES[@]} > 0)) || fail "No CUDA source files found in: $SRC_DIR"
 
-    if [ ! -f "${SRC_FILE}" ]; then
-        echo "Missing kernel source: ${SRC_FILE}"
-        exit 1
-    fi
+rm -rf -- "$BUILD_DIR"
+mkdir -p -- "$BUILD_DIR"
 
-    echo "Compiling ${SRC_FILE}"
-    "${NVCC_BIN}" "${NVCC_FLAGS[@]}" "${HOST_FLAGS[@]}" -dc -c "${SRC_FILE}" -o "${OBJ_FILE}"
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cuda-build.XXXXXX")"
+cleanup() {
+    rm -rf -- "$TEMP_DIR"
+}
+trap cleanup EXIT
 
-    echo "Device linking ${kernel}"
-    "${NVCC_BIN}" "${NVCC_FLAGS[@]}" -dlink "${OBJ_FILE}" -o "${LINK_OBJ}"
+printf 'Building CUDA kernels for %s...\n' "$CUDA_ARCH"
+printf 'CUDA_PATH: %s\n' "$CUDA_PATH"
 
-    echo "Creating static library ${STATIC_LIB}"
-    "${NVCC_BIN}" -lib -o "${STATIC_LIB}" "${OBJ_FILE}"
-
-    echo "Creating shared library ${SHARED_LIB}"
-    "${NVCC_BIN}" "${NVCC_FLAGS[@]}" "${HOST_FLAGS[@]}" -shared -o "${SHARED_LIB}" "${OBJ_FILE}" "${LINK_OBJ}" -L"${CUDA_LIB}" -lcudart -lcublas -lcublasLt
+for src in "${KERNEL_SOURCES[@]}"; do
+    build_kernel "$src"
 done
 
-echo "Build finished"
-ls -la "${BUILD_DIR}"
+printf 'CUDA kernels built successfully!\n'
+printf 'Output: %s\n' "$BUILD_DIR"
+ls -la -- "$BUILD_DIR"
