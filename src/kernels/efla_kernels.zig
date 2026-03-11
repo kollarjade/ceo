@@ -1,24 +1,18 @@
 const std = @import("std");
 
-/// EFLA kernel function declarations (implemented in CUDA)
-/// These are the extern declarations for the CUDA kernels
-
-/// EFLA forward pass kernel
-/// Computes the exact closed-form state update
 pub extern "cuda_efla" fn eflaForwardCuda(
-    k: ?*const anyopaque, // Keys: (batch, seq_len, num_heads, head_dim)
-    v: ?*const anyopaque, // Values: (batch, seq_len, num_heads, head_dim)
-    state: ?*anyopaque, // State: (num_heads, head_dim, head_dim)
-    output: ?*anyopaque, // Output: (batch, seq_len, num_heads, head_dim)
+    k: ?*const anyopaque,
+    v: ?*const anyopaque,
+    state: ?*anyopaque,
+    output: ?*anyopaque,
     batch_size: usize,
     seq_len: usize,
     num_heads: usize,
     head_dim: usize,
     beta: f32,
     chunk_size: usize,
-) callconv(.C) anyerror!void;
+) callconv(.C) c_int;
 
-/// EFLA backward pass kernel
 pub extern "cuda_efla" fn eflaBackwardCuda(
     grad_output: ?*const anyopaque,
     k: ?*const anyopaque,
@@ -32,35 +26,38 @@ pub extern "cuda_efla" fn eflaBackwardCuda(
     num_heads: usize,
     head_dim: usize,
     beta: f32,
-) callconv(.C) anyerror!void;
+) callconv(.C) c_int;
 
-/// EFLA chunked scan kernel
 pub extern "cuda_efla" fn eflaChunkedScanCuda(
     chunk_states: [*]?*anyopaque,
     num_chunks: usize,
     num_heads: usize,
     head_dim: usize,
-) callconv(.C) anyerror!void;
+) callconv(.C) c_int;
 
-/// Reference implementations for testing (CPU)
-
-/// Compute the coefficient c_t = (1 - exp(-beta * lambda)) / lambda
-/// with numerical stability for small lambda
-pub fn computeCoefficient(lambda: f32, beta: f32) f32 {
-    if (lambda < 1e-6) {
-        // Use Taylor series expansion for numerical stability
-        var c: f32 = beta;
-        const beta_lambda = beta * lambda;
-        c -= 0.5 * beta * beta_lambda;
-        c += (1.0 / 6.0) * beta * beta * beta_lambda * lambda;
-        c -= (1.0 / 24.0) * beta * beta * beta * beta_lambda * lambda * lambda;
-        return c;
-    }
-
-    return (1.0 - @exp(-beta * lambda)) / lambda;
+fn squareLen(head_dim: usize) usize {
+    return std.math.mul(usize, head_dim, head_dim) catch @panic("head_dim overflow");
 }
 
-/// EFLA state update: S_t = (I - c_t * k * k^T) * S_{t-1} + c_t * k * v^T
+fn requireEqual(actual: usize, expected: usize) void {
+    if (actual != expected) @panic("invalid dimension");
+}
+
+pub fn computeCoefficient(lambda: f32, beta: f32) f32 {
+    const x = beta * lambda;
+    if (@abs(x) < @as(f32, 1e-4)) {
+        const lambda2 = lambda * lambda;
+        const beta2 = beta * beta;
+        const beta3 = beta2 * beta;
+        const beta4 = beta3 * beta;
+        return beta
+            - @as(f32, 0.5) * beta2 * lambda
+            + (@as(f32, 1.0) / @as(f32, 6.0)) * beta3 * lambda2
+            - (@as(f32, 1.0) / @as(f32, 24.0)) * beta4 * lambda2 * lambda;
+    }
+    return (@as(f32, 1.0) - @exp(-x)) / lambda;
+}
+
 pub fn eflaStateUpdate(
     state: []f32,
     k: []const f32,
@@ -68,36 +65,39 @@ pub fn eflaStateUpdate(
     head_dim: usize,
     beta: f32,
 ) void {
+    requireEqual(k.len, head_dim);
+    requireEqual(v.len, head_dim);
+    requireEqual(state.len, squareLen(head_dim));
+
     var lambda: f32 = 0.0;
-    for (k) |k_val| {
-        lambda += k_val * k_val;
+    for (0..head_dim) |i| {
+        lambda += k[i] * k[i];
     }
 
     const c_t = computeCoefficient(lambda, beta);
 
-    var k_t_s = std.mem.zeroes([128]f32);
-
     for (0..head_dim) |j| {
+        var projection: f32 = 0.0;
         for (0..head_dim) |i| {
-            k_t_s[j] += k[i] * state[i * head_dim + j];
+            projection += k[i] * state[i * head_dim + j];
         }
-    }
-
-    for (0..head_dim) |i| {
-        for (0..head_dim) |j| {
-            state[i * head_dim + j] -= c_t * k[i] * k_t_s[j];
-            state[i * head_dim + j] += c_t * k[i] * v[j];
+        for (0..head_dim) |i| {
+            const idx = i * head_dim + j;
+            state[idx] = state[idx] - c_t * k[i] * projection + c_t * k[i] * v[j];
         }
     }
 }
 
-/// EFLA output computation: o_t = S_t * k_t
 pub fn eflaComputeOutput(
     state: []const f32,
     k: []const f32,
     output: []f32,
     head_dim: usize,
 ) void {
+    requireEqual(state.len, squareLen(head_dim));
+    requireEqual(k.len, head_dim);
+    requireEqual(output.len, head_dim);
+
     for (0..head_dim) |i| {
         var sum: f32 = 0.0;
         for (0..head_dim) |j| {
@@ -108,10 +108,39 @@ pub fn eflaComputeOutput(
 }
 
 test "computeCoefficient" {
-    const c1 = computeCoefficient(1e-8, 1.0);
-    try std.testing.expectApproxEqRel(@as(f32, 1.0), c1, 0.001);
+    const c1 = computeCoefficient(@as(f32, 1e-8), @as(f32, 1.0));
+    try std.testing.expectApproxEqRel(@as(f32, 1.0), c1, @as(f32, 0.001));
 
-    const c2 = computeCoefficient(1.0, 1.0);
-    const expected = (1.0 - @exp(-1.0)) / 1.0;
-    try std.testing.expectApproxEqRel(expected, c2, 0.001);
+    const c2 = computeCoefficient(@as(f32, 1.0), @as(f32, 1.0));
+    const expected: f32 = (@as(f32, 1.0) - @exp(@as(f32, -1.0))) / @as(f32, 1.0);
+    try std.testing.expectApproxEqRel(expected, c2, @as(f32, 0.001));
+}
+
+test "computeCoefficient zero lambda" {
+    const c = computeCoefficient(@as(f32, 0.0), @as(f32, 2.5));
+    try std.testing.expectApproxEqRel(@as(f32, 2.5), c, @as(f32, 1e-6));
+}
+
+test "eflaStateUpdate and eflaComputeOutput" {
+    var state = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const k = [_]f32{ 1.0, 0.0 };
+    const v = [_]f32{ 2.0, 3.0 };
+
+    eflaStateUpdate(state[0..], k[0..], v[0..], 2, @as(f32, 1.0));
+
+    const c: f32 = (@as(f32, 1.0) - @exp(@as(f32, -1.0)));
+
+    try std.testing.expectApproxEqRel(@as(f32, 1.0) + c, state[0], @as(f32, 1e-6));
+    try std.testing.expectApproxEqRel(@as(f32, 3.0) * c, state[1], @as(f32, 1e-6));
+    try std.testing.expectApproxEqRel(@as(f32, 0.0), state[2], @as(f32, 1e-6));
+    try std.testing.expectApproxEqRel(@as(f32, 1.0), state[3], @as(f32, 1e-6));
+
+    var output = [_]f32{ 0.0, 0.0 };
+    eflaComputeOutput(state[0..], k[0..], output[0..], 2);
+
+    try std.testing.expectApproxEqRel(@as(f32, 1.0) + c, output[0], @as(f32, 1e-6));
+    try std.testing.expectApproxEqRel(@as(f32, 0.0), output[1], @as(f32, 1e-6));
 }
