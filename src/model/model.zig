@@ -227,55 +227,53 @@ pub const TransformerBlock = struct {
         self.clearCache();
 
         self.cached_input = try cloneTensor(self.allocator, input);
-        errdefer {
-            self.clearCache();
-        }
+        errdefer self.clearCache();
 
         const normed = try self.ln1.forward(input);
+        errdefer normed.deinit();
         self.cached_normed1 = try cloneTensor(self.allocator, normed);
 
         const efla_result = try self.efla.forward(normed, efla_state);
+        errdefer efla_result.output.deinit();
         const new_efla_state = efla_result.new_state;
+        errdefer if (new_efla_state) |s| s.deinit();
         self.cached_efla_output = try cloneTensor(self.allocator, efla_result.output);
-        errdefer {
-            if (new_efla_state) |s| {
-                s.deinit();
-            }
-        }
 
         const prism_result = try self.prism.forward(normed, efla_result.output, prism_state);
+        errdefer prism_result.output.deinit();
         const new_prism_state = prism_result.new_state;
+        errdefer if (new_prism_state) |s| s.deinit();
         self.cached_prism_output = try cloneTensor(self.allocator, prism_result.output);
-        errdefer {
-            if (new_prism_state) |s| {
-                s.deinit();
-            }
-        }
-
-        normed.deinit();
 
         const residual = try addTensorsFast(self.allocator, input, prism_result.output, self.device, self.device_id);
+        errdefer residual.deinit();
         self.cached_residual1 = try cloneTensor(self.allocator, residual);
 
+        normed.deinit();
         prism_result.output.deinit();
         efla_result.output.deinit();
 
         const normed2 = try self.ln2.forward(residual);
+        errdefer normed2.deinit();
         self.cached_normed2 = try cloneTensor(self.allocator, normed2);
 
         const up = try self.mlp_up.forward(normed2);
+        errdefer up.deinit();
         self.cached_mlp_up = try cloneTensor(self.allocator, up);
-        normed2.deinit();
 
         const activated = try self.activation.forward(self.allocator, up);
+        errdefer activated.deinit();
         self.cached_mlp_activated = try cloneTensor(self.allocator, activated);
-        up.deinit();
 
         const down = try self.mlp_down.forward(activated);
+        errdefer down.deinit();
         self.cached_mlp_down = try cloneTensor(self.allocator, down);
-        activated.deinit();
 
         const output = try addTensorsFast(self.allocator, residual, down, self.device, self.device_id);
+        
+        normed2.deinit();
+        up.deinit();
+        activated.deinit();
         residual.deinit();
         down.deinit();
 
@@ -287,22 +285,15 @@ pub const TransformerBlock = struct {
     }
 
     fn validateTensorForBlock(self: *Self, tensor: *Tensor) !void {
-        if (tensor.dtype != .bf16) {
-            return ModelError.DTypeMismatch;
-        }
-        if (tensor.device != self.device or tensor.device_id != self.device_id) {
-            return ModelError.DeviceMismatch;
-        }
-        if (tensor.shape.ndim != 3) {
-            return ModelError.InvalidInputRank;
-        }
-        if (tensor.shape.dim(2) != self.config.hidden_dim) {
-            return ModelError.ShapeMismatch;
-        }
+        if (tensor.dtype != .bf16) return ModelError.DTypeMismatch;
+        if (tensor.device != self.device or tensor.device_id != self.device_id) return ModelError.DeviceMismatch;
+        if (tensor.shape.ndim != 3) return ModelError.InvalidInputRank;
+        if (tensor.shape.dim(2) != self.config.hidden_dim) return ModelError.ShapeMismatch;
+        return;
     }
 
     pub fn backward(self: *Self, grad_output: *Tensor) !*Tensor {
-        if (self.cached_input == null or self.cached_residual1 == null) {
+        if (self.cached_input == null or self.cached_residual1 == null or self.cached_mlp_up == null) {
             return ModelError.BackwardNotReady;
         }
 
@@ -315,7 +306,7 @@ pub const TransformerBlock = struct {
         const grad_activated = try geluBackward(
             self.allocator,
             grad_down,
-            self.cached_mlp_up orelse return ModelError.BackwardNotReady,
+            self.cached_mlp_up.?,
             self.device,
             self.device_id,
         );
@@ -531,16 +522,23 @@ pub const EflaModel = struct {
         self.clearCache();
 
         const embeds = try self.embed_tokens.forward(input_ids);
+        errdefer embeds.deinit();
         self.cached_embeds = try cloneTensor(self.allocator, embeds);
         errdefer self.clearCache();
 
         var hidden: *Tensor = embeds;
 
         const efla_states_out = try self.allocator.alloc(?*efla_mod.EflaState, self.blocks.len);
-        errdefer self.allocator.free(efla_states_out);
+        errdefer {
+            self.allocator.free(efla_states_out);
+            hidden.deinit();
+        }
 
         const prism_states_out = try self.allocator.alloc(?*prism_mod.PrismState, self.blocks.len);
-        errdefer self.allocator.free(prism_states_out);
+        errdefer {
+            self.allocator.free(prism_states_out);
+            hidden.deinit();
+        }
 
         for (0..self.blocks.len) |i| {
             efla_states_out[i] = null;
@@ -549,14 +547,10 @@ pub const EflaModel = struct {
 
         errdefer {
             for (efla_states_out) |state| {
-                if (state) |s| {
-                    s.deinit();
-                }
+                if (state) |s| s.deinit();
             }
             for (prism_states_out) |state| {
-                if (state) |s| {
-                    s.deinit();
-                }
+                if (state) |s| s.deinit();
             }
         }
 
@@ -567,6 +561,7 @@ pub const EflaModel = struct {
                 t.deinit();
             }
             self.allocator.free(hidden_states_cache);
+            hidden.deinit();
         }
 
         for (self.blocks, 0..) |block, i| {
@@ -593,9 +588,10 @@ pub const EflaModel = struct {
         self.cached_hidden_states = hidden_states_cache;
 
         const normed = try self.final_norm.forward(hidden);
-        self.cached_final_normed = try cloneTensor(self.allocator, normed);
-        hidden.deinit();
         errdefer normed.deinit();
+        self.cached_final_normed = try cloneTensor(self.allocator, normed);
+        
+        hidden.deinit();
 
         const logits = try self.projectToVocab(normed);
         normed.deinit();
@@ -636,12 +632,18 @@ pub const EflaModel = struct {
         var i: usize = self.blocks.len;
         while (i > 0) {
             i -= 1;
-            const grad_block = try self.blocks[i].backward(grad_hidden);
+            const grad_block = self.blocks[i].backward(grad_hidden) catch |err| {
+                grad_hidden.deinit();
+                return err;
+            };
             grad_hidden.deinit();
             grad_hidden = grad_block;
         }
 
-        const grad_embed = try self.embed_tokens.backward(grad_hidden);
+        const grad_embed = self.embed_tokens.backward(grad_hidden) catch |err| {
+            grad_hidden.deinit();
+            return err;
+        };
         grad_hidden.deinit();
 
         return grad_embed;
@@ -848,11 +850,23 @@ pub const EflaModel = struct {
             return ModelError.ShapeMismatch;
         }
 
-        const output_shape = switch (hidden.shape.ndim) {
-            2 => tensor_mod.Shape.init(&[_]usize{ hidden.shape.dim(0), self.config.vocab_size }),
-            3 => tensor_mod.Shape.init(&[_]usize{ hidden.shape.dim(0), hidden.shape.dim(1), self.config.vocab_size }),
+        var output_shape_dims: [3]usize = undefined;
+        var output_ndim: usize = 0;
+        switch (hidden.shape.ndim) {
+            2 => {
+                output_shape_dims[0] = hidden.shape.dim(0);
+                output_shape_dims[1] = self.config.vocab_size;
+                output_ndim = 2;
+            },
+            3 => {
+                output_shape_dims[0] = hidden.shape.dim(0);
+                output_shape_dims[1] = hidden.shape.dim(1);
+                output_shape_dims[2] = self.config.vocab_size;
+                output_ndim = 3;
+            },
             else => return ModelError.InvalidInputRank,
-        };
+        }
+        const output_shape = tensor_mod.Shape.init(output_shape_dims[0..output_ndim]);
 
         const output = try Tensor.init(self.allocator, output_shape, .bf16, self.device, self.device_id);
         errdefer output.deinit();
@@ -912,21 +926,21 @@ fn matVecRowBF16(
     const aligned_cols = (num_cols / VecSize) * VecSize;
 
     for (0..num_rows) |row| {
-        var sum_vec: @Vector(VecSize, f32) = @splat(0.0);
+        var sum: f32 = 0.0;
         const weight_row = weight[row * num_cols ..][0..num_cols];
 
         var k: usize = 0;
         while (k < aligned_cols) : (k += VecSize) {
-            var input_vec: @Vector(VecSize, f32) = undefined;
-            var weight_vec: @Vector(VecSize, f32) = undefined;
+            var in_array: [VecSize]f32 = undefined;
+            var w_array: [VecSize]f32 = undefined;
             inline for (0..VecSize) |vi| {
-                input_vec[vi] = input[k + vi].toFloat32();
-                weight_vec[vi] = weight_row[k + vi].toFloat32();
+                in_array[vi] = input[k + vi].toFloat32();
+                w_array[vi] = weight_row[k + vi].toFloat32();
             }
-            sum_vec += input_vec * weight_vec;
+            const input_vec: @Vector(VecSize, f32) = in_array;
+            const weight_vec: @Vector(VecSize, f32) = w_array;
+            sum += @reduce(.Add, input_vec * weight_vec);
         }
-
-        var sum: f32 = @reduce(.Add, sum_vec);
 
         while (k < num_cols) : (k += 1) {
             sum += input[k].toFloat32() * weight_row[k].toFloat32();
@@ -970,12 +984,14 @@ fn addTensorsFast(
 
     var i: usize = 0;
     while (i < aligned) : (i += VecSize) {
-        var a_vec: @Vector(VecSize, f32) = undefined;
-        var b_vec: @Vector(VecSize, f32) = undefined;
+        var a_arr: [VecSize]f32 = undefined;
+        var b_arr: [VecSize]f32 = undefined;
         inline for (0..VecSize) |vi| {
-            a_vec[vi] = a_ptr[i + vi].toFloat32();
-            b_vec[vi] = b_ptr[i + vi].toFloat32();
+            a_arr[vi] = a_ptr[i + vi].toFloat32();
+            b_arr[vi] = b_ptr[i + vi].toFloat32();
         }
+        const a_vec: @Vector(VecSize, f32) = a_arr;
+        const b_vec: @Vector(VecSize, f32) = b_arr;
         const result_vec = a_vec + b_vec;
         inline for (0..VecSize) |vi| {
             o_ptr[i + vi] = BF16.fromFloat32(result_vec[vi]);
@@ -1064,7 +1080,7 @@ fn vocabProjectBackward(
     const vocab_size = config.vocab_size;
 
     var output_shape_dims: [3]usize = undefined;
-    var output_ndim: usize = undefined;
+    var output_ndim: usize = 0;
     switch (grad_output.shape.ndim) {
         2 => {
             output_shape_dims[0] = grad_output.shape.dim(0);
@@ -1091,15 +1107,45 @@ fn vocabProjectBackward(
     const total_tokens = output.shape.numel() / hidden_dim;
 
     for (0..total_tokens) |token| {
+        const out_offset = token * hidden_dim;
+        for (0..hidden_dim) |h| {
+            out_ptr[out_offset + h] = BF16.fromFloat32(0.0);
+        }
+    }
+
+    for (0..total_tokens) |token| {
         const grad_offset = token * vocab_size;
         const out_offset = token * hidden_dim;
 
-        for (0..hidden_dim) |h| {
-            var sum: f32 = 0.0;
-            for (0..vocab_size) |v| {
-                sum += grad_ptr[grad_offset + v].toFloat32() * weight_ptr[v * hidden_dim + h].toFloat32();
+        for (0..vocab_size) |v| {
+            const g_val = grad_ptr[grad_offset + v].toFloat32();
+            if (g_val == 0.0) continue;
+            
+            for (0..hidden_dim) |h| {
+                const w_val = weight_ptr[v * hidden_dim + h].toFloat32();
+                const current_out = out_ptr[out_offset + h].toFloat32();
+                out_ptr[out_offset + h] = BF16.fromFloat32(current_out + g_val * w_val);
             }
-            out_ptr[out_offset + h] = BF16.fromFloat32(sum);
+        }
+    }
+
+    if (embed_weight.grad) |w_grad| {
+        const w_grad_ptr = w_grad.typedPtr(BF16) orelse return ModelError.UnsupportedOperation;
+        for (0..total_tokens) |token| {
+            const grad_offset = token * vocab_size;
+            const in_offset = token * hidden_dim;
+            
+            for (0..vocab_size) |v| {
+                const g_val = grad_ptr[grad_offset + v].toFloat32();
+                if (g_val == 0.0) continue;
+                
+                for (0..hidden_dim) |h| {
+                    const idx = v * hidden_dim + h;
+                    const current_grad = w_grad_ptr[idx].toFloat32();
+                    const in_val = out_ptr[in_offset + h].toFloat32();
+                    w_grad_ptr[idx] = BF16.fromFloat32(current_grad + g_val * in_val);
+                }
+            }
         }
     }
 
