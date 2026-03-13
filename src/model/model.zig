@@ -235,7 +235,7 @@ pub const TransformerBlock = struct {
         self.cached_normed1 = try cloneTensor(self.allocator, normed);
 
         const efla_result = try self.efla.forward(normed, efla_state);
-        var new_efla_state = efla_result.new_state;
+        const new_efla_state = efla_result.new_state;
         self.cached_efla_output = try cloneTensor(self.allocator, efla_result.output);
         errdefer {
             if (new_efla_state) |s| {
@@ -244,7 +244,7 @@ pub const TransformerBlock = struct {
         }
 
         const prism_result = try self.prism.forward(normed, efla_result.output, prism_state);
-        var new_prism_state = prism_result.new_state;
+        const new_prism_state = prism_result.new_state;
         self.cached_prism_output = try cloneTensor(self.allocator, prism_result.output);
         errdefer {
             if (new_prism_state) |s| {
@@ -561,9 +561,10 @@ pub const EflaModel = struct {
         }
 
         const hidden_states_cache = try self.allocator.alloc(*Tensor, self.blocks.len);
+        var initialized_hidden_cache: usize = 0;
         errdefer {
-            for (hidden_states_cache[0..self.blocks.len]) |t| {
-                _ = t;
+            for (hidden_states_cache[0..initialized_hidden_cache]) |t| {
+                t.deinit();
             }
             self.allocator.free(hidden_states_cache);
         }
@@ -580,6 +581,7 @@ pub const EflaModel = struct {
                 null;
 
             hidden_states_cache[i] = try cloneTensor(self.allocator, hidden);
+            initialized_hidden_cache += 1;
 
             const result = try block.forward(hidden, efla_state, prism_state);
             hidden.deinit();
