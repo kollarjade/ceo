@@ -1,0 +1,552 @@
+
+
+
+environ
+ vocabularies NUMBERS, SUBSET_1, FUNCT_1, RELAT_1, XBOOLE_0, TARSKI, ARYTM_1, ARYTM_3, FINSEQ_1, NAT_1, REAL_1, STRUCT_0;
+ notations TARSKI, XBOOLE_0, SUBSET_1, ORDINAL1, NUMBERS, XCMPLX_0, XREAL_0, REAL_1, NAT_1, RELAT_1, FUNCT_1, FINSEQ_1;
+ constructors NUMBERS, XCMPLX_0, XREAL_0, REAL_1, NAT_1, FINSEQ_1;
+ registrations XBOOLE_0, RELSET_1, NUMBERS, XCMPLX_0, XREAL_0, NAT_1, FINSEQ_1;
+ requirements REAL, NUMERALS, SUBSET, BOOLE, ARITHM;
+ equalities XBOOLE_0;
+ expansions XBOOLE_0;
+ theorems TARSKI, XBOOLE_0, SUBSET_1, FUNCT_1, FINSEQ_1;
+begin
+
+definition
+  mode Allocator is Element of NAT;
+  mode Random is Element of NAT;
+  mode DType is Element of NAT;
+  mode Device is Element of NAT;
+  mode String is FinSequence of NAT;
+end;
+
+definition
+  func BF16 -> DType equals 1;
+  func CPU -> Device equals 1;
+end;
+
+definition
+  struct ShapeStruct (#
+    ndim -> NAT,
+    dims -> FinSequence of NAT
+  #);
+end;
+
+definition
+  struct Tensor (#
+    shape -> ShapeStruct,
+    dtype -> DType,
+    device -> Device,
+    device_id -> NAT,
+    data -> Function of NAT, REAL,
+    grad -> Function of NAT, REAL
+  #);
+end;
+
+definition
+  struct EflaState (#
+    hidden -> Tensor
+  #);
+  struct PrismState (#
+    hidden -> Tensor
+  #);
+  struct ModelConfig (#
+    hidden_dim -> NAT,
+    intermediate_dim -> NAT,
+    num_heads -> NAT,
+    head_dim -> NAT,
+    num_layers -> NAT,
+    vocab_size -> NAT,
+    tie_embeddings -> NAT,
+    efla -> NAT,
+    prism -> NAT
+  #);
+  struct RMSNorm (#
+    weight -> Tensor
+  #);
+  struct Linear (#
+    weight -> Tensor
+  #);
+  struct GELU (#
+    approximate -> NAT
+  #);
+  struct Embedding (#
+    weight -> Tensor
+  #);
+  struct EflaLayer (#
+    w_k -> Tensor,
+    w_v -> Tensor,
+    w_o -> Tensor,
+    beta_param -> Tensor
+  #);
+  struct PrismLayer (#
+    w_beta -> FinSequence of Tensor,
+    w_k -> FinSequence of Tensor,
+    w_p -> FinSequence of Tensor,
+    shortconv -> Linear
+  #);
+end;
+
+definition
+  struct TransformerBlockForwardResult (#
+    output -> Tensor,
+    new_efla_state -> EflaState,
+    new_prism_state -> PrismState
+  #);
+  struct ModelForwardResult (#
+    logits -> Tensor,
+    efla_states -> FinSequence of EflaState,
+    prism_states -> FinSequence of PrismState
+  #);
+  struct TransformerBlock (#
+    ln1 -> RMSNorm,
+    efla -> EflaLayer,
+    prism -> PrismLayer,
+    ln2 -> RMSNorm,
+    mlp_up -> Linear,
+    mlp_down -> Linear,
+    activation -> GELU,
+    config -> ModelConfig,
+    allocator -> Allocator,
+    device -> Device,
+    device_id -> NAT,
+    cached_input -> Tensor,
+    cached_normed1 -> Tensor,
+    cached_efla_output -> Tensor,
+    cached_prism_output -> Tensor,
+    cached_residual1 -> Tensor,
+    cached_normed2 -> Tensor,
+    cached_mlp_up -> Tensor,
+    cached_mlp_activated -> Tensor,
+    cached_mlp_down -> Tensor
+  #);
+  struct EflaModel (#
+    embed_tokens -> Embedding,
+    blocks -> FinSequence of TransformerBlock,
+    final_norm -> RMSNorm,
+    lm_head -> Linear,
+    config -> ModelConfig,
+    allocator -> Allocator,
+    device -> Device,
+    device_id -> NAT,
+    tied_embeddings -> NAT,
+    cached_embeds -> Tensor,
+    cached_hidden_states -> FinSequence of Tensor,
+    cached_final_normed -> Tensor
+  #);
+end;
+
+definition
+  let a be Allocator; let dim be NAT; let d be Device; let id be NAT;
+  func RMSNorm_init(a, dim, d, id) -> RMSNorm means
+    it.weight.shape.ndim = 1;
+end;
+
+definition
+  let self be RMSNorm; let input be Tensor;
+  func RMSNorm_forward(self, input) -> Tensor means
+    it.shape = input.shape;
+end;
+
+definition
+  let self be RMSNorm; let grad be Tensor;
+  func RMSNorm_backward(self, grad) -> Tensor means
+    it.shape = grad.shape;
+end;
+
+definition
+  let a be Allocator; let in_dim be NAT; let out_dim be NAT; let bias be NAT; let d be Device; let id be NAT; let r be Random;
+  func Linear_init(a, in_dim, out_dim, bias, d, id, r) -> Linear means
+    it.weight.shape.ndim = 2;
+end;
+
+definition
+  let self be Linear; let input be Tensor;
+  func Linear_forward(self, input) -> Tensor means
+    it.shape = input.shape;
+end;
+
+definition
+  let self be Linear; let grad be Tensor;
+  func Linear_backward(self, grad) -> Tensor means
+    it.shape = grad.shape;
+end;
+
+definition
+  let approx be NAT;
+  func GELU_init(approx) -> GELU means
+    it.approximate = approx;
+end;
+
+definition
+  let self be GELU; let a be Allocator; let input be Tensor;
+  func GELU_forward(self, a, input) -> Tensor means
+    it.shape = input.shape;
+end;
+
+definition
+  let a be Allocator; let vocab be NAT; let dim be NAT; let d be Device; let id be NAT; let r be Random;
+  func Embedding_init(a, vocab, dim, d, id, r) -> Embedding means
+    it.weight.shape.ndim = 2;
+end;
+
+definition
+  let self be Embedding; let input be Tensor;
+  func Embedding_forward(self, input) -> Tensor means
+    it.shape = input.shape;
+end;
+
+definition
+  let self be Embedding; let grad be Tensor;
+  func Embedding_backward(self, grad) -> Tensor means
+    it.shape = grad.shape;
+end;
+
+definition
+  let a be Allocator; let efla_cfg be NAT; let hidden be NAT; let heads be NAT; let head_dim be NAT; let d be Device; let id be NAT; let r be Random;
+  func EflaLayer_init(a, efla_cfg, hidden, heads, head_dim, d, id, r) -> EflaLayer means
+    it.w_k.shape.ndim = 2;
+end;
+
+definition
+  let self be EflaLayer; let input be Tensor; let state be EflaState;
+  func EflaLayer_forward(self, input, state) -> Tensor means
+    it.shape = input.shape;
+  func EflaLayer_forward_state(self, input, state) -> EflaState means
+    it.hidden.shape = input.shape;
+end;
+
+definition
+  let self be EflaLayer; let grad be Tensor;
+  func EflaLayer_backward(self, grad) -> Tensor means
+    it.shape = grad.shape;
+end;
+
+definition
+  let a be Allocator; let prism_cfg be NAT; let hidden be NAT; let head_dim be NAT; let d be Device; let id be NAT; let r be Random;
+  func PrismLayer_init(a, prism_cfg, hidden, head_dim, d, id, r) -> PrismLayer means
+    it.shortconv.weight.shape.ndim = 1;
+end;
+
+definition
+  let self be PrismLayer; let input be Tensor; let efla_out be Tensor; let state be PrismState;
+  func PrismLayer_forward(self, input, efla_out, state) -> Tensor means
+    it.shape = input.shape;
+  func PrismLayer_forward_state(self, input, efla_out, state) -> PrismState means
+    it.hidden.shape = input.shape;
+end;
+
+definition
+  let self be PrismLayer; let grad be Tensor;
+  func PrismLayer_backward(self, grad) -> Tensor means
+    it.shape = grad.shape;
+end;
+
+definition
+  let self be ModelForwardResult;
+  let a be Allocator;
+  func ModelForwardResult_deinit(self, a) -> NAT means
+    it = 0;
+end;
+
+definition
+  let a be Allocator;
+  let c be ModelConfig;
+  let d be Device;
+  let id be NAT;
+  let r be Random;
+  func TransformerBlock_init(a, c, d, id, r) -> TransformerBlock means
+    it.ln1 = RMSNorm_init(a, c.hidden_dim, d, id) &
+    it.efla = EflaLayer_init(a, c.efla, c.hidden_dim, c.num_heads, c.head_dim, d, id, r) &
+    it.prism = PrismLayer_init(a, c.prism, c.hidden_dim, c.head_dim, d, id, r) &
+    it.ln2 = RMSNorm_init(a, c.hidden_dim, d, id) &
+    it.mlp_up = Linear_init(a, c.hidden_dim, c.intermediate_dim, 0, d, id, r) &
+    it.mlp_down = Linear_init(a, c.intermediate_dim, c.hidden_dim, 0, d, id, r) &
+    it.activation = GELU_init(1) &
+    it.config = c &
+    it.allocator = a &
+    it.device = d &
+    it.device_id = id;
+end;
+
+definition
+  let self be TransformerBlock;
+  func TransformerBlock_deinit(self) -> NAT means
+    it = 0;
+end;
+
+definition
+  let self be TransformerBlock;
+  func TransformerBlock_clearCache(self) -> NAT means
+    it = 0;
+end;
+
+definition
+  let self be TransformerBlock;
+  let tensor be Tensor;
+  func TransformerBlock_validateTensorForBlock(self, tensor) -> NAT means
+    it = 0;
+end;
+
+definition
+  let a be Allocator;
+  let t1 be Tensor;
+  let t2 be Tensor;
+  let d be Device;
+  let id be NAT;
+  func addTensorsFast(a, t1, t2, d, id) -> Tensor means
+    it.shape = t1.shape &
+    it.dtype = t1.dtype &
+    it.device = d &
+    it.device_id = id &
+    for i being Element of NAT holds it.data.i = t1.data.i + t2.data.i;
+end;
+
+definition
+  let a be Allocator;
+  let t be Tensor;
+  func cloneTensor(a, t) -> Tensor means
+    it.shape = t.shape &
+    it.dtype = t.dtype &
+    it.device = t.device &
+    it.device_id = t.device_id &
+    it.data = t.data;
+end;
+
+definition
+  let self be TransformerBlock;
+  let input be Tensor;
+  let efla_state be EflaState;
+  let prism_state be PrismState;
+  func TransformerBlock_forward(self, input, efla_state, prism_state) -> TransformerBlockForwardResult means
+    exists normed, efla_out, prism_out, residual, normed2, up, activated, down, output being Tensor,
+           new_efla being EflaState, new_prism being PrismState st
+      normed = RMSNorm_forward(self.ln1, input) &
+      efla_out = EflaLayer_forward(self.efla, normed, efla_state) &
+      new_efla = EflaLayer_forward_state(self.efla, normed, efla_state) &
+      prism_out = PrismLayer_forward(self.prism, normed, efla_out, prism_state) &
+      new_prism = PrismLayer_forward_state(self.prism, normed, efla_out, prism_state) &
+      residual = addTensorsFast(self.allocator, input, prism_out, self.device, self.device_id) &
+      normed2 = RMSNorm_forward(self.ln2, residual) &
+      up = Linear_forward(self.mlp_up, normed2) &
+      activated = GELU_forward(self.activation, self.allocator, up) &
+      down = Linear_forward(self.mlp_down, activated) &
+      output = addTensorsFast(self.allocator, residual, down, self.device, self.device_id) &
+      it.output = output &
+      it.new_efla_state = new_efla &
+      it.new_prism_state = new_prism;
+end;
+
+definition
+  let a be Allocator;
+  let grad_output be Tensor;
+  let input be Tensor;
+  let d be Device;
+  let id be NAT;
+  func geluBackward(a, grad_output, input, d, id) -> Tensor means
+    it.shape = grad_output.shape &
+    it.dtype = grad_output.dtype &
+    it.device = d &
+    it.device_id = id &
+    for i being Element of NAT holds
+      it.data.i = grad_output.data.i * (0.5 * (1.0 + (0.7978845608028654 * (input.data.i + 0.044715 * (input.data.i * input.data.i * input.data.i)))) + 0.5 * input.data.i * (1.0 - (0.7978845608028654 * (input.data.i + 0.044715 * (input.data.i * input.data.i * input.data.i))) * (0.7978845608028654 * (input.data.i + 0.044715 * (input.data.i * input.data.i * input.data.i)))) * 0.7978845608028654 * (1.0 + 3.0 * 0.044715 * input.data.i * input.data.i));
+end;
+
+definition
+  let self be TransformerBlock;
+  let grad_output be Tensor;
+  func TransformerBlock_backward(self, grad_output) -> Tensor means
+    exists grad_residual1, grad_down, grad_activated, grad_up, grad_ln2, grad_after_first_residual, grad_prism, grad_efla, grad_ln1, grad_input being Tensor st
+      grad_residual1 = cloneTensor(self.allocator, grad_output) &
+      grad_down = Linear_backward(self.mlp_down, grad_output) &
+      grad_activated = geluBackward(self.allocator, grad_down, self.cached_mlp_up, self.device, self.device_id) &
+      grad_up = Linear_backward(self.mlp_up, grad_activated) &
+      grad_ln2 = RMSNorm_backward(self.ln2, grad_up) &
+      grad_after_first_residual = addTensorsFast(self.allocator, grad_residual1, grad_ln2, self.device, self.device_id) &
+      grad_prism = PrismLayer_backward(self.prism, grad_after_first_residual) &
+      grad_efla = EflaLayer_backward(self.efla, grad_prism) &
+      grad_ln1 = RMSNorm_backward(self.ln1, grad_efla) &
+      grad_input = addTensorsFast(self.allocator, grad_after_first_residual, grad_ln1, self.device, self.device_id) &
+      it = grad_input;
+end;
+
+definition
+  let a be Allocator;
+  let config be ModelConfig;
+  let d be Device;
+  let id be NAT;
+  let r be Random;
+  func EflaModel_init(a, config, d, id, r) -> EflaModel means
+    it.embed_tokens = Embedding_init(a, config.vocab_size, config.hidden_dim, d, id, r) &
+    it.final_norm = RMSNorm_init(a, config.hidden_dim, d, id) &
+    (config.tie_embeddings = 0 implies it.lm_head = Linear_init(a, config.hidden_dim, config.vocab_size, 0, d, id, r)) &
+    it.config = config &
+    it.allocator = a &
+    it.device = d &
+    it.device_id = id &
+    it.tied_embeddings = config.tie_embeddings;
+end;
+
+definition
+  let self be EflaModel;
+  func EflaModel_deinit(self) -> NAT means
+    it = 0;
+end;
+
+definition
+  let self be EflaModel;
+  func EflaModel_clearCache(self) -> NAT means
+    it = 0;
+end;
+
+definition
+  let self be EflaModel;
+  let hidden be Tensor;
+  func EflaModel_projectToVocab(self, hidden) -> Tensor means
+    (self.tied_embeddings = 0 implies it = Linear_forward(self.lm_head, hidden)) &
+    (self.tied_embeddings = 1 implies
+       it.shape.ndim = hidden.shape.ndim &
+       it.dtype = BF16 &
+       it.device = self.device &
+       it.device_id = self.device_id);
+end;
+
+definition
+  let self be EflaModel;
+  let input_ids be Tensor;
+  let efla_states_in be FinSequence of EflaState;
+  let prism_states_in be FinSequence of PrismState;
+  func EflaModel_forwardWithStates(self, input_ids, efla_states_in, prism_states_in) -> ModelForwardResult means
+    exists embeds, hidden, normed, logits being Tensor,
+           efla_states_out being FinSequence of EflaState,
+           prism_states_out being FinSequence of PrismState,
+           H being FinSequence of Tensor st
+      embeds = Embedding_forward(self.embed_tokens, input_ids) &
+      H.0 = embeds &
+      (for i being Element of NAT st i < self.config.num_layers holds
+         H.(i+1) = TransformerBlock_forward(self.blocks.(i+1), H.i, efla_states_in.(i+1), prism_states_in.(i+1)).output &
+         efla_states_out.(i+1) = TransformerBlock_forward(self.blocks.(i+1), H.i, efla_states_in.(i+1), prism_states_in.(i+1)).new_efla_state &
+         prism_states_out.(i+1) = TransformerBlock_forward(self.blocks.(i+1), H.i, efla_states_in.(i+1), prism_states_in.(i+1)).new_prism_state) &
+      hidden = H.(self.config.num_layers) &
+      normed = RMSNorm_forward(self.final_norm, hidden) &
+      logits = EflaModel_projectToVocab(self, normed) &
+      it.logits = logits &
+      it.efla_states = efla_states_out &
+      it.prism_states = prism_states_out;
+end;
+
+definition
+  let self be EflaModel;
+  let input_ids be Tensor;
+  func EflaModel_forward(self, input_ids) -> Tensor means
+    exists empty_efla being FinSequence of EflaState, empty_prism being FinSequence of PrismState, res being ModelForwardResult st
+      res = EflaModel_forwardWithStates(self, input_ids, empty_efla, empty_prism) &
+      it = res.logits;
+end;
+
+definition
+  let a be Allocator;
+  let grad_output be Tensor;
+  let embed_weight be Tensor;
+  let config be ModelConfig;
+  let d be Device;
+  let id be NAT;
+  func vocabProjectBackward(a, grad_output, embed_weight, config, d, id) -> Tensor means
+    it.shape.ndim = grad_output.shape.ndim &
+    it.dtype = BF16 &
+    it.device = d &
+    it.device_id = id;
+end;
+
+definition
+  let self be EflaModel;
+  let grad_output be Tensor;
+  func EflaModel_backward(self, grad_output) -> Tensor means
+    exists grad_hidden, grad_after_norm, grad_embed being Tensor,
+           G being FinSequence of Tensor st
+      (self.tied_embeddings = 1 implies grad_hidden = vocabProjectBackward(self.allocator, grad_output, self.embed_tokens.weight, self.config, self.device, self.device_id)) &
+      (self.tied_embeddings = 0 implies grad_hidden = Linear_backward(self.lm_head, grad_output)) &
+      grad_after_norm = RMSNorm_backward(self.final_norm, grad_hidden) &
+      G.(self.config.num_layers) = grad_after_norm &
+      (for i being Element of NAT st i < self.config.num_layers holds
+         G.i = TransformerBlock_backward(self.blocks.(i+1), G.(i+1))) &
+      grad_embed = Embedding_backward(self.embed_tokens, G.0) &
+      it = grad_embed;
+end;
+
+definition
+  let self be EflaModel;
+  let a be Allocator;
+  func EflaModel_collectParameters(self, a) -> FinSequence of Tensor means
+    exists P being FinSequence of Tensor st
+      P.1 = self.embed_tokens.weight &
+      (for i being Element of NAT st i < self.config.num_layers holds
+         P.(i*12 + 2) = self.blocks.(i+1).ln1.weight &
+         P.(i*12 + 3) = self.blocks.(i+1).efla.w_k &
+         P.(i*12 + 4) = self.blocks.(i+1).efla.w_v &
+         P.(i*12 + 5) = self.blocks.(i+1).efla.w_o &
+         P.(i*12 + 6) = self.blocks.(i+1).efla.beta_param &
+         P.(i*12 + 7) = self.blocks.(i+1).prism.shortconv.weight &
+         P.(i*12 + 8) = self.blocks.(i+1).ln2.weight &
+         P.(i*12 + 9) = self.blocks.(i+1).mlp_up.weight &
+         P.(i*12 + 10) = self.blocks.(i+1).mlp_down.weight) &
+      it = P;
+end;
+
+definition
+  let self be EflaModel;
+  let a be Allocator;
+  func EflaModel_getParameterNames(self, a) -> FinSequence of String means
+    exists N being FinSequence of String st
+      it = N;
+end;
+
+definition
+  let self be EflaModel;
+  let a be Allocator;
+  func EflaModel_collectGradients(self, a) -> FinSequence of Tensor means
+    exists G being FinSequence of Tensor st
+      it = G;
+end;
+
+definition
+  let t be Tensor;
+  func tensorNumel(t) -> NAT means
+    it = t.shape.ndim;
+end;
+
+definition
+  let self be EflaModel;
+  func EflaModel_countParameters(self) -> NAT means
+    exists count being NAT, C being FinSequence of NAT st
+      C.0 = tensorNumel(self.embed_tokens.weight) &
+      (for i being Element of NAT st i < self.config.num_layers holds
+         C.(i+1) = C.i + tensorNumel(self.blocks.(i+1).ln1.weight) + tensorNumel(self.blocks.(i+1).efla.w_k) + tensorNumel(self.blocks.(i+1).efla.w_v) + tensorNumel(self.blocks.(i+1).efla.w_o) + tensorNumel(self.blocks.(i+1).efla.beta_param) + tensorNumel(self.blocks.(i+1).prism.shortconv.weight) + tensorNumel(self.blocks.(i+1).ln2.weight) + tensorNumel(self.blocks.(i+1).mlp_up.weight) + tensorNumel(self.blocks.(i+1).mlp_down.weight)) &
+      count = C.(self.config.num_layers) + tensorNumel(self.final_norm.weight) + tensorNumel(self.lm_head.weight) &
+      it = count;
+end;
+
+definition
+  let input be Function of NAT, REAL;
+  let weight be Function of NAT, REAL;
+  let num_rows be NAT;
+  let num_cols be NAT;
+  func matVecRowBF16(input, weight, num_rows, num_cols) -> Function of NAT, REAL means
+    for row being Element of NAT holds
+      it.row = input.row + weight.row;
+end;
+
+theorem EflaModel_parameter_count_matches_collected_parameters_and_names:
+  for a being Allocator, r being Random, config being ModelConfig, model being EflaModel, params being FinSequence of Tensor, names being FinSequence of String, manual_count being NAT st
+    config.hidden_dim = 256 &
+    config.num_layers = 2 &
+    config.intermediate_dim = 512 &
+    config.num_heads = 4 &
+    config.head_dim = 64 &
+    config.tie_embeddings = 0 &
+    model = EflaModel_init(a, config, CPU, 0, r) &
+    params = EflaModel_collectParameters(model, a) &
+    names = EflaModel_getParameterNames(model, a)
+  holds
+    len params = len names &
+    manual_count = EflaModel_countParameters(model);
