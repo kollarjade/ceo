@@ -2,10 +2,7 @@
     .name = "efla-trainer",
     .version = "0.1.0",
     .minimum_zig_version = "0.13.0",
-    .dependencies = .{
-        .// CUDA bindings are handled through extern declarations
-        .// NCCL is linked dynamically at runtime
-    },
+    .dependencies = .{},
     .paths = .{
         "src",
         "kernels",

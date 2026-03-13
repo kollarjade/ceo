@@ -88,7 +88,7 @@ build_kernel() {
 }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
-ROOT_DIR="$SCRIPT_DIR"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd -P)"
 SRC_DIR="$ROOT_DIR/kernels/cuda"
 BUILD_DIR="$ROOT_DIR/build/cuda"
 INCLUDE_DIR="$SRC_DIR/include"

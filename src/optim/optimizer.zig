@@ -49,7 +49,7 @@ pub const Lion = struct {
         }
 
         for (params, 0..) |param, i| {
-            momentum[i] = try Tensor.zeros(allocator, param.shape, .f32, param.device, param.device_id);
+            momentum[i] = try Tensor.zeros(allocator, param.shape, .bf16, param.device, param.device_id);
             initialized_count += 1;
         }
 
@@ -102,6 +102,7 @@ pub const Lion = struct {
                 self.beta1,
                 self.beta2,
                 self.weight_decay,
+                null,
             );
         } else {
             try self.stepParamCpu(param, grad, m);
@@ -109,19 +110,19 @@ pub const Lion = struct {
     }
 
     fn stepParamCpu(self: *Lion, param: *Tensor, grad: *Tensor, m: *Tensor) !void {
-        if (param.dtype != .bf16 or grad.dtype != .bf16 or m.dtype != .f32) return OptimError.UnsupportedDtype;
+        if (param.dtype != .bf16 or grad.dtype != .bf16 or m.dtype != .bf16) return OptimError.UnsupportedDtype;
 
         const numel = param.shape.numel();
         const param_ptr = param.typedPtr(BF16) orelse return OptimError.NotContiguous;
         const grad_ptr = grad.typedPtr(BF16) orelse return OptimError.NotContiguous;
-        const m_ptr = m.typedPtr(f32) orelse return OptimError.NotContiguous;
+        const m_ptr = m.typedPtr(BF16) orelse return OptimError.NotContiguous;
 
         const one_minus_beta1 = 1.0 - self.beta1;
         const one_minus_beta2 = 1.0 - self.beta2;
 
         for (0..numel) |i| {
             const g = grad_ptr[i].toFloat32();
-            const m_old = m_ptr[i];
+            const m_old = m_ptr[i].toFloat32();
             const p = param_ptr[i].toFloat32();
 
             const v = self.beta1 * m_old + one_minus_beta1 * g;
@@ -138,7 +139,7 @@ pub const Lion = struct {
             const p_new = p - update_val;
 
             param_ptr[i] = BF16.fromFloat32(p_new);
-            m_ptr[i] = m_new;
+            m_ptr[i] = BF16.fromFloat32(m_new);
         }
     }
 
@@ -181,7 +182,7 @@ pub const Muon = struct {
         }
 
         for (params, 0..) |param, i| {
-            momentum[i] = try Tensor.zeros(allocator, param.shape, .f32, param.device, param.device_id);
+            momentum[i] = try Tensor.zeros(allocator, param.shape, .bf16, param.device, param.device_id);
             initialized_count += 1;
         }
 
@@ -237,6 +238,7 @@ pub const Muon = struct {
                 self.lr,
                 self.beta,
                 self.ns_iterations,
+                null,
             );
         } else {
             try self.stepParamCpu(param, grad, m, M, N);
@@ -244,21 +246,21 @@ pub const Muon = struct {
     }
 
     fn stepParamCpu(self: *Muon, param: *Tensor, grad: *Tensor, m: *Tensor, M: usize, N: usize) !void {
-        if (param.dtype != .bf16 or grad.dtype != .bf16 or m.dtype != .f32) return OptimError.UnsupportedDtype;
+        if (param.dtype != .bf16 or grad.dtype != .bf16 or m.dtype != .bf16) return OptimError.UnsupportedDtype;
 
         const param_ptr = param.typedPtr(BF16) orelse return OptimError.NotContiguous;
         const grad_ptr = grad.typedPtr(BF16) orelse return OptimError.NotContiguous;
-        const m_ptr = m.typedPtr(f32) orelse return OptimError.NotContiguous;
+        const m_ptr = m.typedPtr(BF16) orelse return OptimError.NotContiguous;
 
         for (0..M * N) |i| {
-            const m_val = m_ptr[i];
+            const m_val = m_ptr[i].toFloat32();
             const g_val = grad_ptr[i].toFloat32();
-            m_ptr[i] = self.beta * m_val + g_val;
+            m_ptr[i] = BF16.fromFloat32(self.beta * m_val + g_val);
         }
 
         var frobenius_sq: f64 = 0.0;
         for (0..M * N) |i| {
-            const val = @as(f64, @floatCast(m_ptr[i]));
+            const val = @as(f64, @floatCast(m_ptr[i].toFloat32()));
             frobenius_sq += val * val;
         }
         const frobenius = @as(f32, @floatCast(@sqrt(frobenius_sq)));
@@ -266,7 +268,7 @@ pub const Muon = struct {
         if (frobenius < 1e-8) {
             for (0..M * N) |i| {
                 const p = param_ptr[i].toFloat32();
-                param_ptr[i] = BF16.fromFloat32(p - self.lr * m_ptr[i]);
+                param_ptr[i] = BF16.fromFloat32(p - self.lr * m_ptr[i].toFloat32());
             }
             return;
         }
@@ -275,7 +277,7 @@ pub const Muon = struct {
         var Y = try self.allocator.alloc(f32, M * N);
         defer self.allocator.free(Y);
         for (0..M * N) |i| {
-            Y[i] = m_ptr[i] * scale;
+            Y[i] = m_ptr[i].toFloat32() * scale;
         }
 
         var YtY = try self.allocator.alloc(f32, N * N);

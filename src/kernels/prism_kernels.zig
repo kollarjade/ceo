@@ -3,7 +3,7 @@ const std = @import("std");
 /// PRISM kernel function declarations (implemented in CUDA)
 
 /// PRISM forward pass kernel
-pub extern "cuda_prism" fn prismForwardCuda(
+pub extern "cuda_prism" fn @"prism_forward_cuda"(
     u: ?*const anyopaque, // Proxy: (batch, seq_len, hidden_dim)
     v: ?*const anyopaque, // Values: (batch, seq_len, hidden_dim)
     prev_state: ?*const anyopaque, // Previous state
@@ -17,7 +17,9 @@ pub extern "cuda_prism" fn prismForwardCuda(
     hidden_dim: usize,
     head_dim: usize,
     num_iterations: usize,
+    tensor_dtype: c_int,
     alpha: f32,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// PRISM backward pass kernel
@@ -36,7 +38,7 @@ pub extern "cuda_prism" fn prismBackwardCuda(
 ) callconv(.C) anyerror!void;
 
 /// ShortConv forward kernel
-pub extern "cuda_prism" fn shortConvForwardCuda(
+pub extern "cuda_prism" fn @"shortconv_forward_cuda"(
     input: ?*const anyopaque, // (batch, seq_len, hidden_dim)
     weight: ?*const anyopaque, // (hidden_dim, window_size)
     output: ?*anyopaque, // (batch, seq_len, hidden_dim)
@@ -44,6 +46,8 @@ pub extern "cuda_prism" fn shortConvForwardCuda(
     seq_len: usize,
     hidden_dim: usize,
     window_size: usize,
+    tensor_dtype: c_int,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// ShortConv backward kernel
@@ -57,7 +61,12 @@ pub extern "cuda_prism" fn shortConvBackwardCuda(
     seq_len: usize,
     hidden_dim: usize,
     window_size: usize,
+    tensor_dtype: c_int,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
+
+pub const prismForwardCuda = @"prism_forward_cuda";
+pub const shortConvForwardCuda = @"shortconv_forward_cuda";
 
 /// GELU activation kernel
 pub fn geluForward(x: f32, approximate: bool) f32 {

@@ -4,6 +4,7 @@ Train 1T parameter models on 8×B200 GPUs
 """
 
 import modal
+from pathlib import Path
 
 # Define the Modal app
 app = modal.App("efla-trainer")
@@ -28,7 +29,7 @@ image = (
         "modal",
         "pyyaml",
     )
-    .copy_local_dir("/home/z/my-project/efla-trainer", "/app/efla-trainer")
+    .copy_local_dir(str((Path(__file__).resolve().parents[2])), "/app/efla-trainer")
     .run_commands(
         # Build the project
         "cd /app/efla-trainer && zig build -Doptimize=ReleaseFast",

@@ -243,7 +243,9 @@ pub const PrismLayer = struct {
             self.hidden_dim,
             self.head_dim,
             self.num_iterations,
+            2,
             self.alpha,
+            null,
         );
     }
 
@@ -437,6 +439,8 @@ pub const ShortConv = struct {
                 seq_len,
                 self.hidden_dim,
                 self.window_size,
+                2,
+                null,
             );
         } else {
             try self.forwardCpu(input, output);
