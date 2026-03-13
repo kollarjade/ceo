@@ -16,6 +16,7 @@ pub const BinaryDataset = struct {
     mmap: ?[]align(std.mem.page_size) const u8,
     num_tokens: usize,
     shard_metadata: []ShardMetadata,
+    token_data_offset: usize,
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -30,7 +31,7 @@ pub const BinaryDataset = struct {
         var reader = buf_reader.reader();
 
         const magic = try reader.readInt(u32, .little);
-        if (magic != 0xEFLAD001) return error.InvalidDatasetFile;
+        if (magic != 0xEF1AD001) return error.InvalidDatasetFile;
 
         const version = try reader.readInt(u32, .little);
         if (version != 1) return error.UnsupportedVersion;
@@ -57,6 +58,9 @@ pub const BinaryDataset = struct {
             };
         }
 
+        const token_data_offset_u64 = try file.getPos();
+        const token_data_offset: usize = @intCast(token_data_offset_u64);
+
         // Memory map the file
         const file_size = try file.getEndPos();
         const mmap = try std.posix.mmap(
@@ -73,6 +77,7 @@ pub const BinaryDataset = struct {
             .mmap = mmap,
             .num_tokens = num_tokens,
             .shard_metadata = shard_metadata,
+            .token_data_offset = token_data_offset,
             .allocator = allocator,
         };
     }
@@ -95,12 +100,8 @@ pub const BinaryDataset = struct {
             return error.OutOfRange;
         }
 
-        // Token data starts after header
-        const header_size = 4 + 4 + 8 + 4; // magic + version + num_tokens + num_shards
-        const shard_data_size = self.shard_metadata.len * (4 + 100 + 8 + 32); // rough estimate
-
-        const token_offset = header_size + shard_data_size + offset * 4;
-        const ptr = @as([*]const u32, @ptrCast(self.mmap.?.ptr + token_offset));
+        const token_offset = self.token_data_offset + offset * @sizeOf(u32);
+        const ptr = @as([*]align(1) const u32, @ptrCast(self.mmap.?.ptr + token_offset));
 
         return ptr[0..len];
     }
@@ -267,7 +268,7 @@ pub const DatasetBuilder = struct {
         var writer = buf_writer.writer();
 
         // Header
-        try writer.writeInt(u32, 0xEFLAD001, .little); // Magic
+        try writer.writeInt(u32, 0xEF1AD001, .little); // Magic
         try writer.writeInt(u32, 1, .little); // Version
         try writer.writeInt(u64, self.total_tokens, .little);
         try writer.writeInt(u32, @intCast(self.shards.items.len), .little);

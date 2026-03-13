@@ -3,17 +3,18 @@ const std = @import("std");
 /// Neural network kernel declarations (implemented in CUDA)
 
 /// RMSNorm forward
-pub extern "cuda_nn" fn rmsNormForwardCuda(
+pub extern "cuda_nn" fn @"rmsnorm_forward_cuda"(
     input: ?*const anyopaque,
     weight: ?*const anyopaque,
     output: ?*anyopaque,
     numel: usize,
     normalized_shape: usize,
     eps: f32,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// RMSNorm backward
-pub extern "cuda_nn" fn rmsNormBackwardCuda(
+pub extern "cuda_nn" fn @"rmsnorm_backward_cuda"(
     grad_output: ?*const anyopaque,
     input: ?*const anyopaque,
     weight: ?*const anyopaque,
@@ -22,10 +23,11 @@ pub extern "cuda_nn" fn rmsNormBackwardCuda(
     numel: usize,
     normalized_shape: usize,
     eps: f32,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// LayerNorm forward
-pub extern "cuda_nn" fn layerNormForwardCuda(
+pub extern "cuda_nn" fn @"layernorm_forward_cuda"(
     input: ?*const anyopaque,
     weight: ?*const anyopaque,
     bias: ?*const anyopaque,
@@ -33,26 +35,32 @@ pub extern "cuda_nn" fn layerNormForwardCuda(
     numel: usize,
     normalized_shape: usize,
     eps: f32,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// GELU forward
-pub extern "cuda_nn" fn geluForwardCuda(
+pub extern "cuda_nn" fn @"gelu_forward_cuda"(
     input: ?*const anyopaque,
     output: ?*anyopaque,
     numel: usize,
     approximate: bool,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
+
+
 /// Softmax forward
-pub extern "cuda_nn" fn softmaxForwardCuda(
+pub extern "cuda_nn" fn @"softmax_forward_cuda"(
     input: ?*const anyopaque,
     output: ?*anyopaque,
-    numel: usize,
+    outer_size: usize,
     dim_size: usize,
+    inner_size: usize,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// GEMM forward (general matrix multiply)
-pub extern "cuda_nn" fn gemmForwardCuda(
+pub extern "cuda_nn" fn @"gemm_forward_cuda"(
     a: ?*const anyopaque,
     b: ?*const anyopaque,
     bias: ?*const anyopaque,
@@ -60,10 +68,14 @@ pub extern "cuda_nn" fn gemmForwardCuda(
     m: usize,
     k: usize,
     n: usize,
+    dtype_a: c_int,
+    dtype_b: c_int,
+    dtype_c: c_int,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// GEMM backward
-pub extern "cuda_nn" fn gemmBackwardCuda(
+pub extern "cuda_nn" fn @"gemm_backward_cuda"(
     grad_c: ?*const anyopaque,
     a: ?*const anyopaque,
     b: ?*const anyopaque,
@@ -73,20 +85,22 @@ pub extern "cuda_nn" fn gemmBackwardCuda(
     m: usize,
     k: usize,
     n: usize,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// Cross entropy loss forward
-pub extern "cuda_nn" fn crossEntropyForwardCuda(
+pub extern "cuda_nn" fn @"cross_entropy_forward_cuda"(
     logits: ?*const anyopaque,
     targets: ?*const anyopaque,
     loss: ?*anyopaque,
     batch_size: usize,
     vocab_size: usize,
     label_smoothing: f32,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// Cross entropy loss backward
-pub extern "cuda_nn" fn crossEntropyBackwardCuda(
+pub extern "cuda_nn" fn @"cross_entropy_backward_cuda"(
     grad_loss: ?*const anyopaque,
     logits: ?*const anyopaque,
     targets: ?*const anyopaque,
@@ -94,16 +108,33 @@ pub extern "cuda_nn" fn crossEntropyBackwardCuda(
     batch_size: usize,
     vocab_size: usize,
     label_smoothing: f32,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// Embedding lookup forward
-pub extern "cuda_nn" fn embeddingForwardCuda(
+pub extern "cuda_nn" fn @"embedding_forward_cuda"(
     indices: ?*const anyopaque,
     weight: ?*const anyopaque,
     output: ?*anyopaque,
     num_indices: usize,
     embedding_dim: usize,
+    weight_dtype: c_int,
+    output_dtype: c_int,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
+
+
+pub const rmsNormForwardCuda = @"rmsnorm_forward_cuda";
+pub const rmsNormBackwardCuda = @"rmsnorm_backward_cuda";
+pub const layerNormForwardCuda = @"layernorm_forward_cuda";
+pub const geluForwardCuda = @"gelu_forward_cuda";
+pub const geluBackwardCuda = @"gelu_backward_cuda";
+pub const softmaxForwardCuda = @"softmax_forward_cuda";
+pub const gemmForwardCuda = @"gemm_forward_cuda";
+pub const gemmBackwardCuda = @"gemm_backward_cuda";
+pub const crossEntropyForwardCuda = @"cross_entropy_forward_cuda";
+pub const crossEntropyBackwardCuda = @"cross_entropy_backward_cuda";
+pub const embeddingForwardCuda = @"embedding_forward_cuda";
 
 /// CPU reference implementations
 
@@ -168,6 +199,8 @@ pub fn layerNormForwardCpu(
         }
     }
 }
+
+
 
 /// Softmax forward (CPU reference)
 pub fn softmaxForwardCpu(input: []const f32, output: []f32, dim_size: usize) void {

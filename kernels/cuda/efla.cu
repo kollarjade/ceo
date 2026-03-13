@@ -148,7 +148,7 @@ __global__ void efla_forward_kernel(
     const size_t head_idx = bh % num_heads;
     const size_t state_base = bh * head_dim * head_dim;
 
-    float* shared = reinterpret_cast<float*>(extern_shared_mem);
+    float* shared = reinterpret_cast<float*>(extern_shared);
 }
 
 __global__ void efla_forward_kernel_impl(

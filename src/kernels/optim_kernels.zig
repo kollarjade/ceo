@@ -3,7 +3,7 @@ const std = @import("std");
 /// Optimizer kernel declarations (implemented in CUDA)
 
 /// Lion optimizer step kernel
-pub extern "cuda_optim" fn lionStepCuda(
+pub extern "cuda_optim" fn @"lion_step_cuda"(
     param: ?*anyopaque,
     grad: ?*const anyopaque,
     momentum: ?*anyopaque,
@@ -12,10 +12,11 @@ pub extern "cuda_optim" fn lionStepCuda(
     beta1: f32,
     beta2: f32,
     weight_decay: f32,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// Muon optimizer step kernel
-pub extern "cuda_optim" fn muonStepCuda(
+pub extern "cuda_optim" fn @"muon_step_cuda"(
     param: ?*anyopaque,
     grad: ?*const anyopaque,
     momentum: ?*anyopaque,
@@ -24,10 +25,11 @@ pub extern "cuda_optim" fn muonStepCuda(
     lr: f32,
     beta: f32,
     ns_iterations: usize,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// AdamW optimizer step kernel
-pub extern "cuda_optim" fn adamWStepCuda(
+pub extern "cuda_optim" fn @"adamw_step_cuda"(
     param: ?*anyopaque,
     grad: ?*const anyopaque,
     exp_avg: ?*anyopaque,
@@ -39,15 +41,17 @@ pub extern "cuda_optim" fn adamWStepCuda(
     eps: f32,
     weight_decay: f32,
     step: usize,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// Gradient clipping by norm kernel
-pub extern "cuda_optim" fn clipGradNormCuda(
+pub extern "cuda_optim" fn @"clip_grad_norm_cuda"(
     grads: [*]?*anyopaque,
-    num_params: usize,
     numels: [*]const usize,
+    num_params: usize,
     max_norm: f32,
     global_norm: *f32,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// Gradient clipping by value kernel
@@ -58,20 +62,34 @@ pub extern "cuda_optim" fn clipGradValueCuda(
 ) callconv(.C) anyerror!void;
 
 /// FP8 quantization kernel
-pub extern "cuda_optim" fn quantizeFP8Cuda(
+pub extern "cuda_optim" fn @"quantize_fp8_cuda"(
     input: ?*const anyopaque,
     output: ?*anyopaque,
     scale: *f32,
     numel: usize,
+    input_format: c_int,
+    output_dtype: c_int,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
 
 /// FP8 dequantization kernel
-pub extern "cuda_optim" fn dequantizeFP8Cuda(
+pub extern "cuda_optim" fn @"dequantize_fp8_cuda"(
     input: ?*const anyopaque,
     output: ?*anyopaque,
     scale: f32,
     numel: usize,
+    input_format: c_int,
+    output_dtype: c_int,
+    stream: ?*anyopaque,
 ) callconv(.C) anyerror!void;
+
+
+pub const lionStepCuda = @"lion_step_cuda";
+pub const muonStepCuda = @"muon_step_cuda";
+pub const adamWStepCuda = @"adamw_step_cuda";
+pub const clipGradNormCuda = @"clip_grad_norm_cuda";
+pub const quantizeFP8Cuda = @"quantize_fp8_cuda";
+pub const dequantizeFP8Cuda = @"dequantize_fp8_cuda";
 
 /// CPU reference implementations
 

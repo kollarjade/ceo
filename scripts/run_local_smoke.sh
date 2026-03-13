@@ -49,7 +49,7 @@ import struct
 import os
 
 # Create header
-magic = 0xEFLAD001
+magic = 0xEF1AD001
 version = 1
 num_tokens = 10000
 num_shards = 1

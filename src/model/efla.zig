@@ -258,6 +258,7 @@ pub const EflaLayer = struct {
                 self.head_dim,
                 beta,
                 self.config.chunk_size,
+                null,
             );
         } else if (self.device == .cpu) {
             try self.eflaForwardCpu(k, v, state, output, beta);

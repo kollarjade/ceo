@@ -71,16 +71,13 @@ typedef enum efla_memory_kind_t {
 cudaError_t efla_forward_cuda(
     const void* k,
     const void* v,
-    const void* initial_state,
-    void* final_state,
+    void* state,
     void* output,
     size_t batch_size,
     size_t seq_len,
     size_t num_heads,
     size_t head_dim,
-    efla_dtype_t tensor_dtype,
     float beta,
-    float lambda,
     size_t chunk_size,
     cudaStream_t stream
 );
@@ -89,29 +86,23 @@ cudaError_t efla_backward_cuda(
     const void* grad_output,
     const void* k,
     const void* v,
-    const void* initial_state,
-    const void* final_state,
+    const void* state,
     void* grad_k,
     void* grad_v,
-    void* grad_initial_state,
+    void* grad_state,
     size_t batch_size,
     size_t seq_len,
     size_t num_heads,
     size_t head_dim,
-    efla_dtype_t tensor_dtype,
     float beta,
-    float lambda,
-    size_t chunk_size,
     cudaStream_t stream
 );
 
 cudaError_t efla_chunked_scan_cuda(
-    void* const* chunk_states,
+    void** chunk_states,
     size_t num_chunks,
-    size_t batch_size,
     size_t num_heads,
     size_t head_dim,
-    efla_dtype_t state_dtype,
     cudaStream_t stream
 );
 
@@ -152,7 +143,6 @@ cudaError_t rmsnorm_forward_cuda(
     void* output,
     size_t numel,
     size_t normalized_shape,
-    efla_dtype_t tensor_dtype,
     float eps,
     cudaStream_t stream
 );
@@ -165,8 +155,6 @@ cudaError_t rmsnorm_backward_cuda(
     void* grad_weight,
     size_t numel,
     size_t normalized_shape,
-    efla_dtype_t tensor_dtype,
-    efla_dtype_t grad_weight_dtype,
     float eps,
     cudaStream_t stream
 );
@@ -178,7 +166,6 @@ cudaError_t layernorm_forward_cuda(
     void* output,
     size_t numel,
     size_t normalized_shape,
-    efla_dtype_t tensor_dtype,
     float eps,
     cudaStream_t stream
 );
@@ -187,7 +174,6 @@ cudaError_t gelu_forward_cuda(
     const void* input,
     void* output,
     size_t numel,
-    efla_dtype_t tensor_dtype,
     bool approximate,
     cudaStream_t stream
 );
@@ -197,7 +183,6 @@ cudaError_t gelu_backward_cuda(
     const void* input,
     void* grad_input,
     size_t numel,
-    efla_dtype_t tensor_dtype,
     bool approximate,
     cudaStream_t stream
 );
@@ -208,7 +193,6 @@ cudaError_t softmax_forward_cuda(
     size_t outer_size,
     size_t dim_size,
     size_t inner_size,
-    efla_dtype_t tensor_dtype,
     cudaStream_t stream
 );
 
@@ -236,12 +220,6 @@ cudaError_t gemm_backward_cuda(
     size_t m,
     size_t k,
     size_t n,
-    efla_dtype_t grad_c_dtype,
-    efla_dtype_t a_dtype,
-    efla_dtype_t b_dtype,
-    efla_dtype_t grad_a_dtype,
-    efla_dtype_t grad_b_dtype,
-    efla_dtype_t grad_bias_dtype,
     cudaStream_t stream
 );
 
@@ -278,7 +256,6 @@ cudaError_t lion_step_cuda(
     const void* grad,
     void* momentum,
     size_t numel,
-    efla_dtype_t tensor_dtype,
     float lr,
     float beta1,
     float beta2,
@@ -292,7 +269,6 @@ cudaError_t muon_step_cuda(
     void* momentum,
     size_t m,
     size_t n,
-    efla_dtype_t tensor_dtype,
     float lr,
     float beta,
     size_t ns_iterations,
@@ -305,7 +281,6 @@ cudaError_t adamw_step_cuda(
     void* exp_avg,
     void* exp_avg_sq,
     size_t numel,
-    efla_dtype_t tensor_dtype,
     float lr,
     float beta1,
     float beta2,
@@ -319,10 +294,8 @@ cudaError_t clip_grad_norm_cuda(
     void** grads,
     const size_t* numels,
     size_t num_params,
-    efla_dtype_t tensor_dtype,
     float max_norm,
     float* global_norm,
-    efla_memory_kind_t global_norm_memory_kind,
     cudaStream_t stream
 );
 
@@ -388,8 +361,6 @@ cudaError_t norm_cuda(
     float* output,
     size_t numel,
     efla_dtype_t dtype,
-    efla_norm_kind_t norm_kind,
-    efla_memory_kind_t output_memory_kind,
     cudaStream_t stream
 );
 

@@ -10,9 +10,9 @@
 
 namespace {
 
-constexpr int kDTypeFp32 = 0;
-constexpr int kDTypeFp16 = 1;
-constexpr int kDTypeBf16 = 2;
+constexpr int kDTypeFp32 = static_cast<int>(EFLA_DTYPE_FLOAT32);
+constexpr int kDTypeFp16 = static_cast<int>(EFLA_DTYPE_FLOAT16);
+constexpr int kDTypeBf16 = static_cast<int>(EFLA_DTYPE_BFLOAT16);
 constexpr int kThreadsPerBlock = 256;
 constexpr int kMaxBlocks = 4096;
 

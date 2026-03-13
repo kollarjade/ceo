@@ -63,6 +63,7 @@ pub const RMSNorm = struct {
                 input.shape.numel(),
                 self.normalized_shape,
                 self.eps,
+                null,
             );
         } else {
             try self.forwardCpu(input, output);
@@ -122,6 +123,7 @@ pub const RMSNorm = struct {
                 input.shape.numel(),
                 self.normalized_shape,
                 self.eps,
+                null,
             );
         } else {
             try self.backwardCpu(grad_output, input, grad_input, grad_weight);
@@ -237,6 +239,7 @@ pub const LayerNorm = struct {
                 input.shape.numel(),
                 self.normalized_shape,
                 self.eps,
+                null,
             );
         } else {
             try self.forwardCpu(input, output);
@@ -308,6 +311,7 @@ pub const LayerNorm = struct {
                 input.shape.numel(),
                 self.normalized_shape,
                 self.eps,
+                null,
             );
         } else {
             try self.backwardCpu(grad_output, input, grad_input, grad_weight, grad_bias);
@@ -384,7 +388,7 @@ pub const GELU = struct {
         errdefer output.deinit();
 
         if (input.device == .cuda) {
-            try kernels.geluForwardCuda(input.ptr(), output.ptr(), input.shape.numel(), self.approximate);
+            try kernels.geluForwardCuda(input.ptr(), output.ptr(), input.shape.numel(), self.approximate, null);
         } else {
             try self.forwardCpu(input, output);
         }
@@ -412,7 +416,7 @@ pub const GELU = struct {
         errdefer grad_input.deinit();
 
         if (input.device == .cuda) {
-            try kernels.geluBackwardCuda(grad_output.ptr(), input.ptr(), grad_input.ptr(), input.shape.numel(), self.approximate);
+            try kernels.geluBackwardCuda(grad_output.ptr(), input.ptr(), grad_input.ptr(), input.shape.numel(), self.approximate, null);
         } else {
             try self.backwardCpu(grad_output, input, grad_input);
         }
@@ -603,11 +607,19 @@ pub const Softmax = struct {
         errdefer output.deinit();
 
         if (input.device == .cuda) {
+            const dim_size = input.shape.dims[self.dim];
+            var inner_size: usize = 1;
+            for (input.shape.dims[self.dim + 1 .. input.shape.ndim]) |d| {
+                inner_size *= d;
+            }
+            const outer_size = input.shape.numel() / (dim_size * inner_size);
             try kernels.softmaxForwardCuda(
                 input.ptr(),
                 output.ptr(),
-                input.shape.numel(),
-                input.shape.dims[self.dim],
+                outer_size,
+                dim_size,
+                inner_size,
+                null,
             );
         } else {
             try self.forwardCpu(input, output);
@@ -834,6 +846,10 @@ pub const Linear = struct {
                 input.shape.numel() / self.in_features,
                 self.in_features,
                 self.out_features,
+                2,
+                2,
+                2,
+                null,
             );
         } else {
             try self.forwardCpu(input, output);
@@ -899,6 +915,7 @@ pub const Linear = struct {
                 input.shape.numel() / self.in_features,
                 self.in_features,
                 self.out_features,
+                null,
             );
         } else {
             try self.backwardCpu(grad_output, input, grad_input, grad_weight, grad_bias);
@@ -1009,7 +1026,7 @@ pub const Embedding = struct {
         if (self.device == .cuda) {
             var output = try Tensor.zeros(self.allocator, out_shape, .bf16, self.device, self.device_id);
             errdefer output.deinit();
-            try kernels.embeddingForwardCuda(input.ptr(), self.weight.ptr(), output.ptr(), input.shape.numel(), self.embedding_dim, self.num_embeddings);
+            _ = kernels.embeddingForwardCuda(input.ptr(), self.weight.ptr(), output.ptr(), input.shape.numel(), self.embedding_dim, 2, 2, null);
             return output;
         }
 

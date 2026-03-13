@@ -144,22 +144,10 @@ fn buildCudaKernels(b: *Build, exe: *Compile, arch: []const u8, cuda_path: []con
     const cuda_files = [_][]const u8{
         "kernels/cuda/gemm.cu",
         "kernels/cuda/layernorm.cu",
-        "kernels/cuda/rmsnorm.cu",
-        "kernels/cuda/gelu.cu",
-        "kernels/cuda/softmax.cu",
-        "kernels/cuda/attention.cu",
         "kernels/cuda/efla.cu",
-        "kernels/cuda/prism.cu",
-        "kernels/cuda/shortconv.cu",
-        "kernels/cuda/scan.cu",
-        "kernels/cuda/embedding.cu",
-        "kernels/cuda/cross_entropy.cu",
-        "kernels/cuda/scatter.cu",
-        "kernels/cuda/gather.cu",
-        "kernels/cuda/reduction.cu",
-        "kernels/cuda/fp8_ops.cu",
-        "kernels/cuda/memory.cu",
+        "kernels/cuda/optim.cu",
         "kernels/cuda/init.cu",
+        "kernels/cuda/stubs.cu",
     };
 
     const nvcc_flags = [_][]const u8{

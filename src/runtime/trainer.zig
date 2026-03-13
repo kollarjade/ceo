@@ -67,8 +67,6 @@ pub const Trainer = struct {
             cfg.training.muon_momentum,
             cfg.training.muon_iterations,
             cfg.training.weight_decay,
-            .cuda,
-            @intCast(runtime.rank),
         );
         errdefer optimizer.deinit();
 
