@@ -53,14 +53,23 @@ pub extern "cuda_prism" fn shortConvBackwardCuda(
     window_size: usize,
 ) callconv(.C) c_int;
 
+fn checkedMul(a: usize, b: usize) usize {
+    return std.math.mul(usize, a, b) catch @panic("dimension overflow");
+}
+
+fn requireAtLeast(actual: usize, needed: usize, name: []const u8) void {
+    if (actual < needed) std.debug.panic("invalid {s}", .{name});
+}
+
 pub fn geluForward(x: f32, approximate: bool) f32 {
     if (approximate) {
         const sqrt_2_over_pi: f32 = 0.7978845608028654;
+        const coeff: f32 = 0.044715;
         const x3 = x * x * x;
-        return @as(f32, 0.5) * x * (@as(f32, 1.0) + @as(f32, std.math.tanh(sqrt_2_over_pi * (x + @as(f32, 0.044715) * x3))));
+        return @as(f32, 0.5) * x * (@as(f32, 1.0) + std.math.tanh(sqrt_2_over_pi * (x + coeff * x3)));
     } else {
-        const sqrt2: f32 = @as(f32, std.math.sqrt(@as(f64, 2.0)));
-        const cdf = @as(f32, 0.5) * (@as(f32, 1.0) + @as(f32, std.math.erf(@as(f32, x / sqrt2))));
+        const sqrt2: f32 = @sqrt(@as(f32, 2.0));
+        const cdf = @as(f32, 0.5) * (@as(f32, 1.0) + std.math.erf(x / sqrt2));
         return x * cdf;
     }
 }
@@ -68,17 +77,17 @@ pub fn geluForward(x: f32, approximate: bool) f32 {
 pub fn geluBackward(x: f32, approximate: bool) f32 {
     if (approximate) {
         const sqrt_2_over_pi: f32 = 0.7978845608028654;
-        const x3 = x * x * x;
-        const tanh_arg = sqrt_2_over_pi * (x + @as(f32, 0.044715) * x3);
-        const tanh_val = @as(f32, std.math.tanh(tanh_arg));
+        const coeff: f32 = 0.044715;
+        const tanh_arg = sqrt_2_over_pi * (x + coeff * x * x * x);
+        const tanh_val = std.math.tanh(tanh_arg);
         const sech_sq = @as(f32, 1.0) - tanh_val * tanh_val;
-        const inner_deriv = sqrt_2_over_pi * (@as(f32, 1.0) + @as(f32, 3.0) * @as(f32, 0.044715) * x * x);
+        const inner_deriv = sqrt_2_over_pi * (@as(f32, 1.0) + @as(f32, 3.0) * coeff * x * x);
         return @as(f32, 0.5) * (@as(f32, 1.0) + tanh_val) + @as(f32, 0.5) * x * sech_sq * inner_deriv;
     } else {
-        const sqrt2: f32 = @as(f32, std.math.sqrt(@as(f64, 2.0)));
-        const cdf = @as(f32, 0.5) * (@as(f32, 1.0) + @as(f32, std.math.erf(@as(f32, x / sqrt2))));
-        const two_pi: f32 = @as(f32, 2.0) * @as(f32, std.math.pi);
-        const pdf = @exp(@as(f32, -0.5) * x * x) / @sqrt(two_pi);
+        const sqrt2: f32 = @sqrt(@as(f32, 2.0));
+        const sqrt_two_pi: f32 = @sqrt(@as(f32, 2.0) * @as(f32, std.math.pi));
+        const cdf = @as(f32, 0.5) * (@as(f32, 1.0) + std.math.erf(x / sqrt2));
+        const pdf = @exp(-@as(f32, 0.5) * x * x) / sqrt_two_pi;
         return cdf + x * pdf;
     }
 }
@@ -86,7 +95,7 @@ pub fn geluBackward(x: f32, approximate: bool) f32 {
 pub fn outerProduct(a: []const f32, b: []const f32, result: []f32) void {
     const m = a.len;
     const n = b.len;
-    if (result.len < m * n) return;
+    requireAtLeast(result.len, checkedMul(m, n), "result length");
 
     for (0..m) |i| {
         for (0..n) |j| {
@@ -96,9 +105,9 @@ pub fn outerProduct(a: []const f32, b: []const f32, result: []f32) void {
 }
 
 pub fn rank1Update(a: []f32, x: []const f32, y: []const f32, alpha: f32, m: usize, n: usize) void {
-    if (a.len < m * n) return;
-    if (x.len < m) return;
-    if (y.len < n) return;
+    requireAtLeast(a.len, checkedMul(m, n), "matrix length");
+    requireAtLeast(x.len, m, "x length");
+    requireAtLeast(y.len, n, "y length");
 
     for (0..m) |i| {
         for (0..n) |j| {
@@ -108,11 +117,9 @@ pub fn rank1Update(a: []f32, x: []const f32, y: []const f32, alpha: f32, m: usiz
 }
 
 test "geluForward" {
-    try std.testing.expectApproxEqRel(@as(f32, 0.0), geluForward(0.0, true), 0.01);
-
-    try std.testing.expectApproxEqRel(@as(f32, 0.841), geluForward(1.0, true), 0.01);
-
-    try std.testing.expectApproxEqRel(@as(f32, -0.159), geluForward(-1.0, true), 0.02);
+    try std.testing.expectApproxEqRel(@as(f32, 0.0), geluForward(0.0, true), @as(f32, 0.01));
+    try std.testing.expectApproxEqRel(@as(f32, 0.841), geluForward(1.0, true), @as(f32, 0.01));
+    try std.testing.expectApproxEqRel(@as(f32, -0.159), geluForward(-1.0, true), @as(f32, 0.02));
 }
 
 test "outerProduct" {
@@ -120,7 +127,7 @@ test "outerProduct" {
     const b = [_]f32{ 3.0, 4.0, 5.0 };
     var result = [_]f32{0} ** 6;
 
-    outerProduct(&a, &b, &result);
+    outerProduct(a[0..], b[0..], result[0..]);
 
     try std.testing.expectEqual(@as(f32, 3.0), result[0]);
     try std.testing.expectEqual(@as(f32, 4.0), result[1]);
