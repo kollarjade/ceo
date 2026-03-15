@@ -64,6 +64,26 @@ pub extern "cuda_optim" fn dequantizeFP8Cuda(
     numel: usize,
 ) callconv(.C) c_int;
 
+fn checkedMul(a: usize, b: usize) usize {
+    return std.math.mul(usize, a, b) catch @panic("dimension overflow");
+}
+
+fn requireEqual(actual: usize, expected: usize, name: []const u8) void {
+    if (actual != expected) std.debug.panic("invalid {s}", .{name});
+}
+
+fn requirePositive(value: f32, name: []const u8) void {
+    if (!(value > 0.0) or value != value) std.debug.panic("invalid {s}", .{name});
+}
+
+fn requireNonNegative(value: f32, name: []const u8) void {
+    if (value < 0.0 or value != value) std.debug.panic("invalid {s}", .{name});
+}
+
+fn requireBeta(value: f32, name: []const u8) void {
+    if (value < 0.0 or value >= 1.0 or value != value) std.debug.panic("invalid {s}", .{name});
+}
+
 pub fn lionStepCpu(
     param: []f32,
     grad: []const f32,
@@ -73,21 +93,21 @@ pub fn lionStepCpu(
     beta2: f32,
     weight_decay: f32,
 ) void {
-    const len = @min(param.len, @min(grad.len, momentum.len));
-    const one_minus_beta1 = 1.0 - beta1;
-    const one_minus_beta2 = 1.0 - beta2;
+    requireEqual(grad.len, param.len, "grad length");
+    requireEqual(momentum.len, param.len, "momentum length");
+    requireNonNegative(lr, "lr");
+    requireBeta(beta1, "beta1");
+    requireBeta(beta2, "beta2");
+    requireNonNegative(weight_decay, "weight_decay");
 
-    for (0..len) |idx| {
-        const p = param[idx];
-        const g = grad[idx];
-        const m = momentum[idx];
+    const one_minus_beta1 = @as(f32, 1.0) - beta1;
+    const one_minus_beta2 = @as(f32, 1.0) - beta2;
 
-        const v = beta1 * m + one_minus_beta1 * g;
-
-        momentum[idx] = beta2 * m + one_minus_beta2 * g;
-
-        const sign_v: f32 = if (v > 0.0) @as(f32, 1.0) else if (v < 0.0) @as(f32, -1.0) else @as(f32, 0.0);
-        param[idx] = p - lr * sign_v - lr * weight_decay * p;
+    for (param, grad, momentum) |*p, g, *m| {
+        const v = beta1 * m.* + one_minus_beta1 * g;
+        m.* = beta2 * m.* + one_minus_beta2 * g;
+        const sign_v: f32 = if (v > 0.0) 1.0 else if (v < 0.0) -1.0 else 0.0;
+        p.* -= lr * sign_v + lr * weight_decay * p.*;
     }
 }
 
@@ -103,26 +123,31 @@ pub fn adamWStepCpu(
     weight_decay: f32,
     step: usize,
 ) void {
-    if (step == 0) return;
-    const len = @min(param.len, @min(grad.len, @min(exp_avg.len, exp_avg_sq.len)));
-    const step_f: f32 = @floatFromInt(step);
+    requireEqual(grad.len, param.len, "grad length");
+    requireEqual(exp_avg.len, param.len, "exp_avg length");
+    requireEqual(exp_avg_sq.len, param.len, "exp_avg_sq length");
+    requireNonNegative(lr, "lr");
+    requireBeta(beta1, "beta1");
+    requireBeta(beta2, "beta2");
+    requirePositive(eps, "eps");
+    requireNonNegative(weight_decay, "weight_decay");
+    if (step == 0) @panic("invalid step");
+
+    const step_f = @as(f32, @floatFromInt(step));
     const beta1_t = std.math.pow(f32, beta1, step_f);
     const beta2_t = std.math.pow(f32, beta2, step_f);
     const bias_correction1 = @as(f32, 1.0) / (@as(f32, 1.0) - beta1_t);
     const bias_correction2 = @as(f32, 1.0) / (@as(f32, 1.0) - beta2_t);
 
-    for (0..len) |idx| {
-        const g = grad[idx];
+    for (param, grad, exp_avg, exp_avg_sq) |*p, g, *ea, *eas| {
+        ea.* = beta1 * ea.* + (@as(f32, 1.0) - beta1) * g;
+        eas.* = beta2 * eas.* + (@as(f32, 1.0) - beta2) * g * g;
 
-        exp_avg[idx] = beta1 * exp_avg[idx] + (@as(f32, 1.0) - beta1) * g;
-
-        exp_avg_sq[idx] = beta2 * exp_avg_sq[idx] + (@as(f32, 1.0) - beta2) * g * g;
-
-        const avg = exp_avg[idx] * bias_correction1;
-        const avg_sq = exp_avg_sq[idx] * bias_correction2;
-
+        const avg = ea.* * bias_correction1;
+        const avg_sq = eas.* * bias_correction2;
         const denom = @sqrt(avg_sq) + eps;
-        param[idx] -= lr * (avg / denom + weight_decay * param[idx]);
+
+        p.* -= lr * (avg / denom + weight_decay * p.*);
     }
 }
 
@@ -131,11 +156,12 @@ pub fn newtonSchulzIteration(
     temp: []f32,
     m: usize,
     n: usize,
-    allocator: std.mem.Allocator,
 ) void {
-    if (m * n == 0) return;
-    if (temp.len < n * n) return;
-    if (Y.len < m * n) return;
+    const mn = checkedMul(m, n);
+    const nn = checkedMul(n, n);
+
+    if (Y.len < mn) @panic("invalid Y length");
+    if (temp.len < nn) @panic("invalid temp length");
 
     for (0..n) |i| {
         for (0..n) |j| {
@@ -149,13 +175,13 @@ pub fn newtonSchulzIteration(
 
     for (0..n) |i| {
         for (0..n) |j| {
-            const identity: f32 = if (i == j) @as(f32, 3.0) else @as(f32, 0.0);
+            const identity: f32 = if (i == j) 3.0 else 0.0;
             temp[i * n + j] = identity - temp[i * n + j];
         }
     }
 
-    const y_new = allocator.alloc(f32, m * n) catch return;
-    defer allocator.free(y_new);
+    var Y_new = std.heap.page_allocator.alloc(f32, mn) catch @panic("out of memory");
+    defer std.heap.page_allocator.free(Y_new);
 
     for (0..m) |i| {
         for (0..n) |j| {
@@ -163,11 +189,11 @@ pub fn newtonSchulzIteration(
             for (0..n) |k| {
                 sum += Y[i * n + k] * temp[k * n + j];
             }
-            y_new[i * n + j] = 0.5 * sum;
+            Y_new[i * n + j] = @as(f32, 0.5) * sum;
         }
     }
 
-    @memcpy(Y[0 .. m * n], y_new[0 .. m * n]);
+    @memcpy(Y[0..mn], Y_new[0..mn]);
 }
 
 pub fn computeGradNorm(grads: []const []const f32) f64 {
@@ -175,24 +201,29 @@ pub fn computeGradNorm(grads: []const []const f32) f64 {
 
     for (grads) |grad| {
         for (grad) |g| {
-            norm_sq += @as(f64, g) * @as(f64, g);
+            const g64: f64 = g;
+            norm_sq += g64 * g64;
         }
     }
 
     return @sqrt(norm_sq);
 }
 
-pub fn clipGradNormCpu(grads: [][]f32, max_norm: f32) f32 {
+pub fn clipGradNormCpu(grads: []const []f32, max_norm: f32) f32 {
+    requireNonNegative(max_norm, "max_norm");
+
     var norm_sq: f64 = 0.0;
     for (grads) |grad| {
         for (grad) |g| {
-            norm_sq += @as(f64, g) * @as(f64, g);
+            const g64: f64 = g;
+            norm_sq += g64 * g64;
         }
     }
-    const norm: f64 = @sqrt(norm_sq);
 
-    if (norm > @as(f64, max_norm)) {
-        const scale: f32 = max_norm / @as(f32, @floatCast(norm));
+    const norm = @sqrt(norm_sq);
+
+    if (norm > @as(f64, max_norm) and norm > 0.0) {
+        const scale = max_norm / @as(f32, @floatCast(norm));
         for (grads) |grad| {
             for (grad) |*g| {
                 g.* *= scale;
@@ -200,7 +231,7 @@ pub fn clipGradNormCpu(grads: [][]f32, max_norm: f32) f32 {
         }
     }
 
-    return @floatCast(norm);
+    return @as(f32, @floatCast(norm));
 }
 
 test "lionStepCpu" {
@@ -208,10 +239,9 @@ test "lionStepCpu" {
     const grad = [_]f32{ 0.1, 0.1, 0.1, 0.1 };
     var momentum = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
 
-    lionStepCpu(&param, &grad, &momentum, 0.01, 0.9, 0.99, 0.0);
+    lionStepCpu(param[0..], grad[0..], momentum[0..], 0.01, 0.9, 0.99, 0.0);
 
     try std.testing.expect(param[0] != 1.0);
-
     try std.testing.expect(momentum[0] != 0.0);
 }
 
@@ -221,7 +251,7 @@ test "adamWStepCpu" {
     var exp_avg = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
     var exp_avg_sq = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
 
-    adamWStepCpu(&param, &grad, &exp_avg, &exp_avg_sq, 0.01, 0.9, 0.999, 1e-8, 0.0, 1);
+    adamWStepCpu(param[0..], grad[0..], exp_avg[0..], exp_avg_sq[0..], 0.01, 0.9, 0.999, 1e-8, 0.0, 1);
 
     try std.testing.expect(param[0] != 1.0);
 }
@@ -233,7 +263,7 @@ test "clipGradNormCpu" {
 
     const norm = clipGradNormCpu(grads[0..], 5.0);
 
-    try std.testing.expectApproxEqRel(@as(f32, 11.18), norm, 0.01);
+    try std.testing.expectApproxEqRel(@as(f32, 11.18), norm, @as(f32, 0.01));
 
     var new_norm_sq: f32 = 0.0;
     for (grads) |grad| {
@@ -241,5 +271,5 @@ test "clipGradNormCpu" {
             new_norm_sq += g * g;
         }
     }
-    try std.testing.expectApproxEqRel(@as(f32, 5.0), @sqrt(new_norm_sq), 0.01);
+    try std.testing.expectApproxEqRel(@as(f32, 5.0), @sqrt(new_norm_sq), @as(f32, 0.01));
 }
