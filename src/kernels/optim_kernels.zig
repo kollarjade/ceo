@@ -1,8 +1,5 @@
 const std = @import("std");
 
-/// Optimizer kernel declarations (implemented in CUDA)
-
-/// Lion optimizer step kernel
 pub extern "cuda_optim" fn lionStepCuda(
     param: ?*anyopaque,
     grad: ?*const anyopaque,
@@ -12,9 +9,8 @@ pub extern "cuda_optim" fn lionStepCuda(
     beta1: f32,
     beta2: f32,
     weight_decay: f32,
-) callconv(.C) anyerror!void;
+) callconv(.C) c_int;
 
-/// Muon optimizer step kernel
 pub extern "cuda_optim" fn muonStepCuda(
     param: ?*anyopaque,
     grad: ?*const anyopaque,
@@ -24,9 +20,8 @@ pub extern "cuda_optim" fn muonStepCuda(
     lr: f32,
     beta: f32,
     ns_iterations: usize,
-) callconv(.C) anyerror!void;
+) callconv(.C) c_int;
 
-/// AdamW optimizer step kernel
 pub extern "cuda_optim" fn adamWStepCuda(
     param: ?*anyopaque,
     grad: ?*const anyopaque,
@@ -39,43 +34,36 @@ pub extern "cuda_optim" fn adamWStepCuda(
     eps: f32,
     weight_decay: f32,
     step: usize,
-) callconv(.C) anyerror!void;
+) callconv(.C) c_int;
 
-/// Gradient clipping by norm kernel
 pub extern "cuda_optim" fn clipGradNormCuda(
     grads: [*]?*anyopaque,
     num_params: usize,
     numels: [*]const usize,
     max_norm: f32,
     global_norm: *f32,
-) callconv(.C) anyerror!void;
+) callconv(.C) c_int;
 
-/// Gradient clipping by value kernel
 pub extern "cuda_optim" fn clipGradValueCuda(
     grad: ?*anyopaque,
     numel: usize,
     max_value: f32,
-) callconv(.C) anyerror!void;
+) callconv(.C) c_int;
 
-/// FP8 quantization kernel
 pub extern "cuda_optim" fn quantizeFP8Cuda(
     input: ?*const anyopaque,
     output: ?*anyopaque,
     scale: *f32,
     numel: usize,
-) callconv(.C) anyerror!void;
+) callconv(.C) c_int;
 
-/// FP8 dequantization kernel
 pub extern "cuda_optim" fn dequantizeFP8Cuda(
     input: ?*const anyopaque,
     output: ?*anyopaque,
     scale: f32,
     numel: usize,
-) callconv(.C) anyerror!void;
+) callconv(.C) c_int;
 
-/// CPU reference implementations
-
-/// Lion step (CPU reference)
 pub fn lionStepCpu(
     param: []f32,
     grad: []const f32,
@@ -85,23 +73,24 @@ pub fn lionStepCpu(
     beta2: f32,
     weight_decay: f32,
 ) void {
+    const len = @min(param.len, @min(grad.len, momentum.len));
     const one_minus_beta1 = 1.0 - beta1;
     const one_minus_beta2 = 1.0 - beta2;
 
-    for (param, grad, momentum) |*p, g, *m| {
-        // v_t = β1 * m_{t-1} + (1-β1) * g_t
-        const v = beta1 * m.* + one_minus_beta1 * g;
+    for (0..len) |idx| {
+        const p = param[idx];
+        const g = grad[idx];
+        const m = momentum[idx];
 
-        // m_t = β2 * m_{t-1} + (1-β2) * g_t
-        m.* = beta2 * m.* + one_minus_beta2 * g;
+        const v = beta1 * m + one_minus_beta1 * g;
 
-        // Update: x = x - lr * sign(v) - lr * weight_decay * x
-        const sign_v: f32 = if (v > 0) 1.0 else if (v < 0) -1.0 else 0.0;
-        p.* -= lr * sign_v + lr * weight_decay * p.*;
+        momentum[idx] = beta2 * m + one_minus_beta2 * g;
+
+        const sign_v: f32 = if (v > 0.0) @as(f32, 1.0) else if (v < 0.0) @as(f32, -1.0) else @as(f32, 0.0);
+        param[idx] = p - lr * sign_v - lr * weight_decay * p;
     }
 }
 
-/// AdamW step (CPU reference)
 pub fn adamWStepCpu(
     param: []f32,
     grad: []const f32,
@@ -114,38 +103,40 @@ pub fn adamWStepCpu(
     weight_decay: f32,
     step: usize,
 ) void {
-    const beta1_t = std.math.pow(f32, beta1, @floatFromInt(step));
-    const beta2_t = std.math.pow(f32, beta2, @floatFromInt(step));
-    const bias_correction1 = 1.0 / (1.0 - beta1_t);
-    const bias_correction2 = 1.0 / (1.0 - beta2_t);
+    if (step == 0) return;
+    const len = @min(param.len, @min(grad.len, @min(exp_avg.len, exp_avg_sq.len)));
+    const step_f: f32 = @floatFromInt(step);
+    const beta1_t = std.math.pow(f32, beta1, step_f);
+    const beta2_t = std.math.pow(f32, beta2, step_f);
+    const bias_correction1 = @as(f32, 1.0) / (@as(f32, 1.0) - beta1_t);
+    const bias_correction2 = @as(f32, 1.0) / (@as(f32, 1.0) - beta2_t);
 
-    for (param, grad, exp_avg, exp_avg_sq) |*p, g, *ea, *eas| {
-        // Update biased first moment estimate
-        ea.* = beta1 * ea.* + (1.0 - beta1) * g;
+    for (0..len) |idx| {
+        const g = grad[idx];
 
-        // Update biased second raw moment estimate
-        eas.* = beta2 * eas.* + (1.0 - beta2) * g * g;
+        exp_avg[idx] = beta1 * exp_avg[idx] + (@as(f32, 1.0) - beta1) * g;
 
-        // Compute bias-corrected estimates
-        const avg = ea.* * bias_correction1;
-        const avg_sq = eas.* * bias_correction2;
+        exp_avg_sq[idx] = beta2 * exp_avg_sq[idx] + (@as(f32, 1.0) - beta2) * g * g;
 
-        // Update parameters
+        const avg = exp_avg[idx] * bias_correction1;
+        const avg_sq = exp_avg_sq[idx] * bias_correction2;
+
         const denom = @sqrt(avg_sq) + eps;
-        p.* -= lr * (avg / denom + weight_decay * p.*);
+        param[idx] -= lr * (avg / denom + weight_decay * param[idx]);
     }
 }
 
-/// Newton-Schulz iteration for orthogonalization (CPU reference)
 pub fn newtonSchulzIteration(
     Y: []f32,
     temp: []f32,
     m: usize,
     n: usize,
+    allocator: std.mem.Allocator,
 ) void {
-    // Y_{k+1} = 0.5 * Y_k * (3I - Y_k^T Y_k)
+    if (m * n == 0) return;
+    if (temp.len < n * n) return;
+    if (Y.len < m * n) return;
 
-    // Compute Y_k^T Y_k
     for (0..n) |i| {
         for (0..n) |j| {
             var sum: f32 = 0.0;
@@ -156,16 +147,15 @@ pub fn newtonSchulzIteration(
         }
     }
 
-    // Compute 3I - Y_k^T Y_k
     for (0..n) |i| {
         for (0..n) |j| {
-            const identity: f32 = if (i == j) 3.0 else 0.0;
+            const identity: f32 = if (i == j) @as(f32, 3.0) else @as(f32, 0.0);
             temp[i * n + j] = identity - temp[i * n + j];
         }
     }
 
-    // Compute Y * (3I - Y^T Y)
-    var Y_new = std.mem.zeroes([4096]f32);
+    const y_new = allocator.alloc(f32, m * n) catch return;
+    defer allocator.free(y_new);
 
     for (0..m) |i| {
         for (0..n) |j| {
@@ -173,14 +163,13 @@ pub fn newtonSchulzIteration(
             for (0..n) |k| {
                 sum += Y[i * n + k] * temp[k * n + j];
             }
-            Y_new[i * n + j] = 0.5 * sum;
+            y_new[i * n + j] = 0.5 * sum;
         }
     }
 
-    @memcpy(Y, Y_new[0 .. m * n]);
+    @memcpy(Y[0 .. m * n], y_new[0 .. m * n]);
 }
 
-/// Compute gradient norm
 pub fn computeGradNorm(grads: []const []const f32) f64 {
     var norm_sq: f64 = 0.0;
 
@@ -193,20 +182,17 @@ pub fn computeGradNorm(grads: []const []const f32) f64 {
     return @sqrt(norm_sq);
 }
 
-/// Clip gradients by norm
-pub fn clipGradNormCpu(grads: []][]f32, max_norm: f32) f32 {
-    // Compute norm
+pub fn clipGradNormCpu(grads: [][]f32, max_norm: f32) f32 {
     var norm_sq: f64 = 0.0;
     for (grads) |grad| {
         for (grad) |g| {
             norm_sq += @as(f64, g) * @as(f64, g);
         }
     }
-    const norm = @sqrt(norm_sq);
+    const norm: f64 = @sqrt(norm_sq);
 
-    // Clip if necessary
-    if (norm > max_norm) {
-        const scale = max_norm / @as(f32, @floatCast(norm));
+    if (norm > @as(f64, max_norm)) {
+        const scale: f32 = max_norm / @as(f32, @floatCast(norm));
         for (grads) |grad| {
             for (grad) |*g| {
                 g.* *= scale;
@@ -224,10 +210,8 @@ test "lionStepCpu" {
 
     lionStepCpu(&param, &grad, &momentum, 0.01, 0.9, 0.99, 0.0);
 
-    // Params should have changed
     try std.testing.expect(param[0] != 1.0);
 
-    // Momentum should have been updated
     try std.testing.expect(momentum[0] != 0.0);
 }
 
@@ -239,21 +223,18 @@ test "adamWStepCpu" {
 
     adamWStepCpu(&param, &grad, &exp_avg, &exp_avg_sq, 0.01, 0.9, 0.999, 1e-8, 0.0, 1);
 
-    // Params should have changed
     try std.testing.expect(param[0] != 1.0);
 }
 
 test "clipGradNormCpu" {
     var grad1 = [_]f32{ 3.0, 4.0 };
     var grad2 = [_]f32{ 6.0, 8.0 };
-    var grads = [_][]f32{ &grad1, &grad2 };
+    var grads = [_][]f32{ grad1[0..], grad2[0..] };
 
-    const norm = clipGradNormCpu(&grads, 5.0);
+    const norm = clipGradNormCpu(grads[0..], 5.0);
 
-    // Original norm should be sqrt(9+16+36+64) = sqrt(125) ≈ 11.18
     try std.testing.expectApproxEqRel(@as(f32, 11.18), norm, 0.01);
 
-    // After clipping, norm should be 5.0
     var new_norm_sq: f32 = 0.0;
     for (grads) |grad| {
         for (grad) |g| {
