@@ -6,7 +6,6 @@ pub const TokenizerType = enum {
     word,
 };
 
-/// Tokenizer configuration
 pub const TokenizerConfig = struct {
     vocab_size: usize,
     tokenizer_type: TokenizerType,
@@ -17,17 +16,17 @@ pub const TokenizerConfig = struct {
     eos_token: []const u8,
 };
 
-/// BPE Tokenizer implementation
 pub const Tokenizer = struct {
     vocab: std.StringHashMap(u32),
     vocab_inv: std.ArrayList([]const u8),
     merges: std.ArrayList(Merge),
     special_tokens: std.StringHashMap(u32),
-    byte_encoder: [256]u32,
-    byte_decoder: std.ArrayList(u8),
+    special_token_ids: std.ArrayList(u32),
     allocator: std.mem.Allocator,
 
     const Self = @This();
+    const file_magic: u32 = 0x544B5A31;
+    const default_special_tokens = [_][]const u8{ "<pad>", "<unk>", "<bos>", "<eos>" };
 
     pub const Merge = struct {
         first: u32,
@@ -35,316 +34,99 @@ pub const Tokenizer = struct {
         result: u32,
     };
 
-    /// Train a new tokenizer
-    pub fn train(
-        allocator: std.mem.Allocator,
-        corpus_path: []const u8,
-        vocab_size: usize,
-        tokenizer_type: TokenizerType,
-    ) !Self {
-        _ = tokenizer_type;
+    const Pair = struct {
+        first: u32,
+        second: u32,
+    };
 
-        // Read corpus
-        const file = try std.fs.cwd().openFile(corpus_path, .{});
-        defer file.close();
+    const SpecialMatch = struct {
+        id: u32,
+        len: usize,
+    };
 
-        const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-        defer allocator.free(content);
-
-        return trainFromText(allocator, content, vocab_size);
-    }
-
-    /// Train tokenizer from text in memory
-    pub fn trainFromText(
-        allocator: std.mem.Allocator,
-        text: []const u8,
-        vocab_size: usize,
-    ) !Self {
-        var self = Self{
+    fn initEmpty(allocator: std.mem.Allocator) Self {
+        return .{
             .vocab = std.StringHashMap(u32).init(allocator),
             .vocab_inv = std.ArrayList([]const u8).init(allocator),
             .merges = std.ArrayList(Merge).init(allocator),
             .special_tokens = std.StringHashMap(u32).init(allocator),
-            .byte_encoder = undefined,
-            .byte_decoder = std.ArrayList(u8).init(allocator),
+            .special_token_ids = std.ArrayList(u32).init(allocator),
             .allocator = allocator,
         };
-        errdefer self.deinit();
-
-        // Initialize byte encoder/decoder
-        // Map bytes to printable characters for BPE
-        var n: u32 = 0;
-        for (0..256) |b| {
-            const ch: u8 = if (b >= 33 and b <= 126 and b != 39 and b != 92)
-                @intCast(b)
-            else if (b == 39)
-                39
-            else
-                blk: {
-                    n += 1;
-                    break :blk @intCast(256 + n - 1);
-                };
-
-            self.byte_encoder[b] = ch;
-        }
-
-        // Initialize with byte-level tokens
-        for (0..256) |b| {
-            const token = try allocator.dupe(u8, &[_]u8{@intCast(b)});
-            const id: u32 = @intCast(self.vocab_inv.items.len);
-            try self.vocab.put(token, id);
-            try self.vocab_inv.append(token);
-        }
-
-        // Add special tokens
-        const special = [_][]const u8{ "<pad>", "<unk>", "<bos>", "<eos>" };
-        for (special) |tok| {
-            const id: u32 = @intCast(self.vocab_inv.items.len);
-            const token = try allocator.dupe(u8, tok);
-            try self.vocab.put(token, id);
-            try self.vocab_inv.append(token);
-            try self.special_tokens.put(tok, id);
-        }
-
-        // Pre-tokenize text into words
-        var words = std.ArrayList([]const u8).init(allocator);
-        defer words.deinit();
-
-        var word_frequencies = std.StringHashMap(usize).init(allocator);
-        defer word_frequencies.deinit();
-
-        // Split by whitespace
-        var iter = std.mem.split(u8, text, " \n\t\r");
-        while (iter.next()) |word| {
-            if (word.len == 0) continue;
-
-            const owned = try allocator.dupe(u8, word);
-            try words.append(owned);
-
-            const entry = try word_frequencies.getOrPut(owned);
-            if (entry.found_existing) {
-                entry.value_ptr.* += 1;
-            } else {
-                entry.value_ptr.* = 1;
-            }
-        }
-
-        // Build initial vocabulary from character frequencies
-        var char_freqs = std.AutoHashMap(u8, usize).init(allocator);
-        defer char_freqs.deinit();
-
-        for (text) |ch| {
-            const entry = try char_freqs.getOrPut(ch);
-            if (entry.found_existing) {
-                entry.value_ptr.* += 1;
-            } else {
-                entry.value_ptr.* = 1;
-            }
-        }
-
-        // BPE training iterations
-        var num_merges = vocab_size - 256 - special.len;
-        var current_vocab_size = self.vocab_inv.items.len;
-
-        while (current_vocab_size < vocab_size and num_merges > 0) {
-            // Find most frequent pair
-            var best_pair: ?struct { u32, u32 } = null;
-            var best_freq: usize = 0;
-
-            var pair_freqs = std.AutoHashMap(struct { u32, u32 }, usize).init(allocator);
-            defer pair_freqs.deinit();
-
-            for (words.items) |word| {
-                const tokens = try self.encodeWord(allocator, word);
-                defer allocator.free(tokens);
-
-                if (tokens.len < 2) continue;
-
-                for (0..tokens.len - 1) |i| {
-                    const pair = .{ tokens[i], tokens[i + 1] };
-                    const entry = try pair_freqs.getOrPut(pair);
-                    if (entry.found_existing) {
-                        entry.value_ptr.* += 1;
-                    } else {
-                        entry.value_ptr.* = 1;
-                    }
-                }
-            }
-
-            var iter_pairs = pair_freqs.iterator();
-            while (iter_pairs.next()) |entry| {
-                if (entry.value_ptr.* > best_freq) {
-                    best_freq = entry.value_ptr.*;
-                    best_pair = entry.key_ptr.*;
-                }
-            }
-
-            if (best_pair == null) break;
-
-            // Merge the best pair
-            const first = best_pair.?.@"0";
-            const second = best_pair.?.@"1";
-
-            // Create new token
-            const first_token = self.vocab_inv.items[first];
-            const second_token = self.vocab_inv.items[second];
-
-            var new_token = std.ArrayList(u8).init(allocator);
-            try new_token.appendSlice(first_token);
-            try new_token.appendSlice(second_token);
-
-            const new_token_slice = try new_token.toOwnedSlice();
-            const new_id: u32 = @intCast(self.vocab_inv.items.len);
-
-            try self.vocab.put(new_token_slice, new_id);
-            try self.vocab_inv.append(new_token_slice);
-
-            // Record merge
-            try self.merges.append(.{
-                .first = first,
-                .second = second,
-                .result = new_id,
-            });
-
-            current_vocab_size += 1;
-            num_merges -= 1;
-        }
-
-        return self;
     }
 
-    /// Load tokenizer from file
-    pub fn load(allocator: std.mem.Allocator, path: []const u8) !Self {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-
-        var self = Self{
-            .vocab = std.StringHashMap(u32).init(allocator),
-            .vocab_inv = std.ArrayList([]const u8).init(allocator),
-            .merges = std.ArrayList(Merge).init(allocator),
-            .special_tokens = std.StringHashMap(u32).init(allocator),
-            .byte_encoder = undefined,
-            .byte_decoder = std.ArrayList(u8).init(allocator),
-            .allocator = allocator,
-        };
-        errdefer self.deinit();
-
-        var buf_reader = std.io.bufferedReader(file.reader());
-        var reader = buf_reader.reader();
-
-        // Read header
-        const magic = try reader.readInt(u32, .little);
-        if (magic != 0xEFLA0001) return error.InvalidTokenizerFile;
-
-        const vocab_size = try reader.readInt(u32, .little);
-
-        // Read vocabulary
-        for (0..vocab_size) |_| {
-            const token_len = try reader.readInt(u32, .little);
-            const token = try allocator.alloc(u8, token_len);
-            try reader.readNoEof(token);
-
-            const id: u32 = @intCast(self.vocab_inv.items.len);
-            try self.vocab.put(token, id);
-            try self.vocab_inv.append(token);
-        }
-
-        // Read merges
-        const num_merges = try reader.readInt(u32, .little);
-        for (0..num_merges) |_| {
-            const first = try reader.readInt(u32, .little);
-            const second = try reader.readInt(u32, .little);
-            const result = try reader.readInt(u32, .little);
-            try self.merges.append(.{ .first = first, .second = second, .result = result });
-        }
-
-        return self;
+    fn usizeToU32(value: usize) !u32 {
+        if (value > std.math.maxInt(u32)) return error.ValueTooLarge;
+        return @intCast(value);
     }
 
-    /// Save tokenizer to file
-    pub fn save(self: *Self, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
-
-        var buf_writer = std.io.bufferedWriter(file.writer());
-        var writer = buf_writer.writer();
-
-        // Write header
-        try writer.writeInt(u32, 0xEFLA0001, .little);
-        try writer.writeInt(u32, @intCast(self.vocab_inv.items.len), .little);
-
-        // Write vocabulary
-        for (self.vocab_inv.items) |token| {
-            try writer.writeInt(u32, @intCast(token.len), .little);
-            try writer.writeAll(token);
+    fn appendToken(self: *Self, token: []const u8, add_to_vocab_map: bool) !u32 {
+        const id = try usizeToU32(self.vocab_inv.items.len);
+        try self.vocab_inv.append(token);
+        if (add_to_vocab_map) {
+            const entry = try self.vocab.getOrPut(token);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = id;
+            }
         }
-
-        // Write merges
-        try writer.writeInt(u32, @intCast(self.merges.items.len), .little);
-        for (self.merges.items) |merge| {
-            try writer.writeInt(u32, merge.first, .little);
-            try writer.writeInt(u32, merge.second, .little);
-            try writer.writeInt(u32, merge.result, .little);
-        }
-
-        try buf_writer.flush();
+        return id;
     }
 
-    pub fn deinit(self: *Self) void {
-        var iter = self.vocab.iterator();
-        while (iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.vocab.deinit();
+    fn addSpecialToken(self: *Self, token_text: []const u8) !void {
+        const token = try self.allocator.dupe(u8, token_text);
+        const id = try self.appendToken(token, true);
+        try self.special_tokens.put(token, id);
+        try self.special_token_ids.append(id);
+    }
 
-        for (self.vocab_inv.items) |token| {
+    fn tokenExists(self: *const Self, token: []const u8) ?u32 {
+        return self.vocab.get(token);
+    }
+
+    fn comparePairLess(a: Pair, b: Pair) bool {
+        if (a.first != b.first) return a.first < b.first;
+        return a.second < b.second;
+    }
+
+    fn buildMergedToken(self: *Self, first: u32, second: u32) ![]u8 {
+        if (first >= self.vocab_inv.items.len or second >= self.vocab_inv.items.len) {
+            return error.InvalidToken;
+        }
+        const first_token = self.vocab_inv.items[first];
+        const second_token = self.vocab_inv.items[second];
+        var merged = try self.allocator.alloc(u8, first_token.len + second_token.len);
+        @memcpy(merged[0..first_token.len], first_token);
+        @memcpy(merged[first_token.len..], second_token);
+        return merged;
+    }
+
+    fn addOrReuseMergedToken(self: *Self, token: []const u8) !u32 {
+        if (self.special_tokens.get(token)) |_| {
+            const duplicate = try self.allocator.dupe(u8, token);
+            return try self.appendToken(duplicate, false);
+        }
+        if (self.tokenExists(token)) |existing_id| {
             self.allocator.free(token);
+            return existing_id;
         }
-        self.vocab_inv.deinit();
-        self.merges.deinit();
-        self.special_tokens.deinit();
-        self.byte_decoder.deinit();
+        return try self.appendToken(token, true);
     }
 
-    /// Encode text to tokens
-    pub fn encode(self: *Self, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
-        var tokens = std.ArrayList(u32).init(allocator);
-        defer {
-            if (tokens.items.len > 0) {
-                // Don't deinit if we're returning the items
+    fn matchSpecialAt(self: *const Self, text: []const u8, start: usize) ?SpecialMatch {
+        var best: ?SpecialMatch = null;
+        for (self.special_token_ids.items) |id| {
+            const token = self.vocab_inv.items[id];
+            if (token.len == 0) continue;
+            if (start + token.len > text.len) continue;
+            if (!std.mem.eql(u8, text[start .. start + token.len], token)) continue;
+            if (best == null or token.len > best.?.len) {
+                best = .{ .id = id, .len = token.len };
             }
         }
-
-        // Check for special tokens first
-        if (self.special_tokens.get(text)) |id| {
-            try tokens.append(id);
-            return tokens.toOwnedSlice();
-        }
-
-        // Encode each word
-        var iter = std.mem.split(u8, text, " \n\t\r");
-        while (iter.next()) |word| {
-            if (word.len == 0) continue;
-
-            const word_tokens = try self.encodeWord(allocator, word);
-            defer allocator.free(word_tokens);
-
-            try tokens.appendSlice(word_tokens);
-        }
-
-        return tokens.toOwnedSlice();
+        return best;
     }
 
-    fn encodeWord(self: *Self, allocator: std.mem.Allocator, word: []const u8) ![]u32 {
-        // Convert to byte tokens
-        var tokens = std.ArrayList(u32).init(allocator);
-        defer tokens.deinit();
-
-        for (word) |byte| {
-            try tokens.append(self.byte_encoder[byte]);
-        }
-
-        // Apply merges
+    fn applyMergesInPlace(self: *const Self, tokens: *std.ArrayList(u32)) !void {
         for (self.merges.items) |merge| {
             var i: usize = 0;
             while (i + 1 < tokens.items.len) {
@@ -356,31 +138,280 @@ pub const Tokenizer = struct {
                 }
             }
         }
+    }
+
+    fn encodeBytes(self: *const Self, allocator: std.mem.Allocator, bytes: []const u8) ![]u32 {
+        var tokens = std.ArrayList(u32).init(allocator);
+        errdefer tokens.deinit();
+        try tokens.ensureTotalCapacity(bytes.len);
+        for (bytes) |byte| {
+            tokens.appendAssumeCapacity(@as(u32, byte));
+        }
+        try self.applyMergesInPlace(&tokens);
+        return tokens.toOwnedSlice();
+    }
+
+    fn encodeWord(self: *const Self, allocator: std.mem.Allocator, word: []const u8) ![]u32 {
+        return self.encodeBytes(allocator, word);
+    }
+
+    pub fn train(
+        allocator: std.mem.Allocator,
+        corpus_path: []const u8,
+        vocab_size: usize,
+        tokenizer_type: TokenizerType,
+    ) !Self {
+        switch (tokenizer_type) {
+            .bpe => {},
+            else => return error.UnsupportedTokenizerType,
+        }
+
+        const file = try std.fs.cwd().openFile(corpus_path, .{});
+        defer file.close();
+
+        const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
+        defer allocator.free(content);
+
+        return trainFromText(allocator, content, vocab_size);
+    }
+
+    pub fn trainFromText(
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        vocab_size: usize,
+    ) !Self {
+        if (vocab_size < 256 + default_special_tokens.len) return error.VocabSizeTooSmall;
+
+        var self = Self.initEmpty(allocator);
+        errdefer self.deinit();
+
+        for (0..256) |b| {
+            const token = try allocator.alloc(u8, 1);
+            token[0] = @intCast(b);
+            _ = try self.appendToken(token, true);
+        }
+
+        for (default_special_tokens) |token_text| {
+            try self.addSpecialToken(token_text);
+        }
+
+        var corpus = std.ArrayList(u32).init(allocator);
+        defer corpus.deinit();
+        errdefer corpus.deinit();
+
+        try corpus.ensureTotalCapacity(text.len);
+        for (text) |byte| {
+            corpus.appendAssumeCapacity(@as(u32, byte));
+        }
+
+        while (self.vocab_inv.items.len < vocab_size and corpus.items.len >= 2) {
+            var pair_freqs = std.AutoHashMap(Pair, usize).init(allocator);
+            defer pair_freqs.deinit();
+
+            var i: usize = 0;
+            while (i + 1 < corpus.items.len) : (i += 1) {
+                const pair = Pair{
+                    .first = corpus.items[i],
+                    .second = corpus.items[i + 1],
+                };
+                const entry = try pair_freqs.getOrPut(pair);
+                if (entry.found_existing) {
+                    entry.value_ptr.* += 1;
+                } else {
+                    entry.value_ptr.* = 1;
+                }
+            }
+
+            var best_pair: ?Pair = null;
+            var best_freq: usize = 0;
+
+            var iter_pairs = pair_freqs.iterator();
+            while (iter_pairs.next()) |entry| {
+                const pair = entry.key_ptr.*;
+                const freq = entry.value_ptr.*;
+                if (freq > best_freq) {
+                    best_freq = freq;
+                    best_pair = pair;
+                } else if (freq == best_freq and best_pair != null and comparePairLess(pair, best_pair.?)) {
+                    best_pair = pair;
+                }
+            }
+
+            if (best_pair == null or best_freq == 0) break;
+
+            const merged_token = try self.buildMergedToken(best_pair.?.first, best_pair.?.second);
+            const result_id = try self.addOrReuseMergedToken(merged_token);
+
+            try self.merges.append(.{
+                .first = best_pair.?.first,
+                .second = best_pair.?.second,
+                .result = result_id,
+            });
+
+            var next_corpus = std.ArrayList(u32).init(allocator);
+            errdefer next_corpus.deinit();
+            try next_corpus.ensureTotalCapacity(corpus.items.len);
+
+            i = 0;
+            while (i < corpus.items.len) {
+                if (i + 1 < corpus.items.len and corpus.items[i] == best_pair.?.first and corpus.items[i + 1] == best_pair.?.second) {
+                    try next_corpus.append(result_id);
+                    i += 2;
+                } else {
+                    try next_corpus.append(corpus.items[i]);
+                    i += 1;
+                }
+            }
+
+            corpus.deinit();
+            corpus = next_corpus;
+        }
+
+        return self;
+    }
+
+    pub fn load(allocator: std.mem.Allocator, path: []const u8) !Self {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+
+        var self = Self.initEmpty(allocator);
+        errdefer self.deinit();
+
+        var buf_reader = std.io.bufferedReader(file.reader());
+        var reader = buf_reader.reader();
+
+        const magic = try reader.readInt(u32, .little);
+        if (magic != file_magic) return error.InvalidTokenizerFile;
+
+        const vocab_size_u32 = try reader.readInt(u32, .little);
+        const special_count_u32 = try reader.readInt(u32, .little);
+        const merge_count_u32 = try reader.readInt(u32, .little);
+
+        const vocab_size: usize = @as(usize, vocab_size_u32);
+        const special_count: usize = @as(usize, special_count_u32);
+        const merge_count: usize = @as(usize, merge_count_u32);
+
+        if (special_count > vocab_size) return error.InvalidTokenizerFile;
+
+        for (0..vocab_size) |_| {
+            const token_len_u32 = try reader.readInt(u32, .little);
+            const token_len: usize = @as(usize, token_len_u32);
+            const token = try allocator.alloc(u8, token_len);
+            errdefer allocator.free(token);
+            try reader.readNoEof(token);
+            _ = try self.appendToken(token, true);
+        }
+
+        for (0..special_count) |_| {
+            const id = try reader.readInt(u32, .little);
+            if (id >= self.vocab_inv.items.len) return error.InvalidTokenizerFile;
+            const token = self.vocab_inv.items[id];
+            try self.special_tokens.put(token, id);
+            try self.special_token_ids.append(id);
+        }
+
+        for (0..merge_count) |_| {
+            const first = try reader.readInt(u32, .little);
+            const second = try reader.readInt(u32, .little);
+            const result = try reader.readInt(u32, .little);
+            if (first >= self.vocab_inv.items.len or second >= self.vocab_inv.items.len or result >= self.vocab_inv.items.len) {
+                return error.InvalidTokenizerFile;
+            }
+            try self.merges.append(.{
+                .first = first,
+                .second = second,
+                .result = result,
+            });
+        }
+
+        return self;
+    }
+
+    pub fn save(self: *const Self, path: []const u8) !void {
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+
+        var buf_writer = std.io.bufferedWriter(file.writer());
+        var writer = buf_writer.writer();
+
+        try writer.writeInt(u32, file_magic, .little);
+        try writer.writeInt(u32, try usizeToU32(self.vocab_inv.items.len), .little);
+        try writer.writeInt(u32, try usizeToU32(self.special_token_ids.items.len), .little);
+        try writer.writeInt(u32, try usizeToU32(self.merges.items.len), .little);
+
+        for (self.vocab_inv.items) |token| {
+            try writer.writeInt(u32, try usizeToU32(token.len), .little);
+            try writer.writeAll(token);
+        }
+
+        for (self.special_token_ids.items) |id| {
+            try writer.writeInt(u32, id, .little);
+        }
+
+        for (self.merges.items) |merge| {
+            try writer.writeInt(u32, merge.first, .little);
+            try writer.writeInt(u32, merge.second, .little);
+            try writer.writeInt(u32, merge.result, .little);
+        }
+
+        try buf_writer.flush();
+    }
+
+    pub fn deinit(self: *Self) void {
+        for (self.vocab_inv.items) |token| {
+            self.allocator.free(token);
+        }
+        self.vocab.deinit();
+        self.vocab_inv.deinit();
+        self.merges.deinit();
+        self.special_tokens.deinit();
+        self.special_token_ids.deinit();
+    }
+
+    pub fn encode(self: *const Self, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        var tokens = std.ArrayList(u32).init(allocator);
+        errdefer tokens.deinit();
+
+        var segment_start: usize = 0;
+        var i: usize = 0;
+
+        while (i < text.len) {
+            if (self.matchSpecialAt(text, i)) |special| {
+                if (segment_start < i) {
+                    const part = try self.encodeBytes(allocator, text[segment_start..i]);
+                    defer allocator.free(part);
+                    try tokens.appendSlice(part);
+                }
+                try tokens.append(special.id);
+                i += special.len;
+                segment_start = i;
+            } else {
+                i += 1;
+            }
+        }
+
+        if (segment_start < text.len) {
+            const part = try self.encodeBytes(allocator, text[segment_start..]);
+            defer allocator.free(part);
+            try tokens.appendSlice(part);
+        }
 
         return tokens.toOwnedSlice();
     }
 
-    /// Decode tokens to text
-    pub fn decode(self: *Self, allocator: std.mem.Allocator, tokens: []const u32) ![]u8 {
+    pub fn decode(self: *const Self, allocator: std.mem.Allocator, tokens: []const u32) ![]u8 {
         var text = std.ArrayList(u8).init(allocator);
-        defer {
-            if (text.items.len > 0) {}
-        }
+        errdefer text.deinit();
 
         for (tokens) |token| {
-            if (token >= self.vocab_inv.items.len) {
-                return error.InvalidToken;
-            }
-
-            const token_str = self.vocab_inv.items[token];
-            try text.appendSlice(token_str);
+            if (token >= self.vocab_inv.items.len) return error.InvalidToken;
+            try text.appendSlice(self.vocab_inv.items[token]);
         }
 
         return text.toOwnedSlice();
     }
 
-    /// Encode a file
-    pub fn encodeFile(self: *Self, input_path: []const u8, output_path: []const u8) !void {
+    pub fn encodeFile(self: *const Self, input_path: []const u8, output_path: []const u8) !void {
         const input_file = try std.fs.cwd().openFile(input_path, .{});
         defer input_file.close();
 
@@ -390,47 +421,41 @@ pub const Tokenizer = struct {
         const tokens = try self.encode(self.allocator, content);
         defer self.allocator.free(tokens);
 
-        const output_file = try std.fs.cwd().createFile(output_path, .{});
+        const output_file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
         defer output_file.close();
 
         var buf_writer = std.io.bufferedWriter(output_file.writer());
         var writer = buf_writer.writer();
 
-        // Write as binary token sequence
         try writer.writeInt(u64, tokens.len, .little);
-        for (tokens) |t| {
-            try writer.writeInt(u32, t, .little);
+        for (tokens) |token| {
+            try writer.writeInt(u32, token, .little);
         }
 
         try buf_writer.flush();
     }
 
-    /// Get vocabulary size
-    pub fn vocabSize(self: *Self) usize {
+    pub fn vocabSize(self: *const Self) usize {
         return self.vocab_inv.items.len;
     }
 
-    /// Get token ID
-    pub fn getTokenId(self: *Self, token: []const u8) ?u32 {
+    pub fn getTokenId(self: *const Self, token: []const u8) ?u32 {
         return self.vocab.get(token);
     }
 
-    /// Get token string
-    pub fn getToken(self: *Self, id: u32) ?[]const u8 {
+    pub fn getToken(self: *const Self, id: u32) ?[]const u8 {
         if (id >= self.vocab_inv.items.len) return null;
         return self.vocab_inv.items[id];
     }
 };
 
-test "Tokenizer train and encode/decode" {
+test "Tokenizer train and encode decode exact roundtrip" {
     const allocator = std.testing.allocator;
-
-    const text = "hello world hello there";
-
-    var tokenizer = try Tokenizer.trainFromText(allocator, text, 300);
+    const text = "hello world hello there\nwith spaces\tand symbols \\ <bos> but literal bytes";
+    var tokenizer = try Tokenizer.trainFromText(allocator, text, 320);
     defer tokenizer.deinit();
 
-    const tokens = try tokenizer.encode(allocator, "hello");
+    const tokens = try tokenizer.encode(allocator, text);
     defer allocator.free(tokens);
 
     try std.testing.expect(tokens.len > 0);
@@ -438,5 +463,35 @@ test "Tokenizer train and encode/decode" {
     const decoded = try tokenizer.decode(allocator, tokens);
     defer allocator.free(decoded);
 
-    try std.testing.expectEqualStrings("hello", decoded);
+    try std.testing.expectEqualStrings(text, decoded);
+}
+
+test "Tokenizer special tokens remain atomic" {
+    const allocator = std.testing.allocator;
+    const text = "abc<bos>def<eos>";
+    var tokenizer = try Tokenizer.trainFromText(allocator, "abcdef", 300);
+    defer tokenizer.deinit();
+
+    const tokens = try tokenizer.encode(allocator, text);
+    defer allocator.free(tokens);
+
+    try std.testing.expect(tokens.len >= 2);
+
+    const bos_id = tokenizer.getTokenId("<bos>") orelse return error.TestUnexpectedResult;
+    const eos_id = tokenizer.getTokenId("<eos>") orelse return error.TestUnexpectedResult;
+
+    var saw_bos = false;
+    var saw_eos = false;
+    for (tokens) |token| {
+        if (token == bos_id) saw_bos = true;
+        if (token == eos_id) saw_eos = true;
+    }
+
+    try std.testing.expect(saw_bos);
+    try std.testing.expect(saw_eos);
+
+    const decoded = try tokenizer.decode(allocator, tokens);
+    defer allocator.free(decoded);
+
+    try std.testing.expectEqualStrings(text, decoded);
 }
