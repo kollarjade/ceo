@@ -8,63 +8,122 @@ pub const Tensor = tensor_mod.Tensor;
 pub const Shape = tensor_mod.Shape;
 pub const DType = dtype_mod.DType;
 
-/// PRISM (Parallel Residual Iterative Sequence Model) Layer
-///
-/// Implements PRISM's core mechanism:
-///
-/// 1. Input-anchored proxy:
-///    u_t = ShortConv(X_{≤t}) ≈ S_{t-1} k_t
-///
-/// 2. Iterative rank accumulation:
-///    B_t = Σ_{l=1..L} β_t^(l) · (δ_t^(l) ⊗ k_t^(l))
-///
-/// 3. Compute gates and projections from u_t:
-///    β_t^(l) = W_beta^(l) u_t
-///    k_t^(l) = W_k^(l) u_t
-///
-/// 4. Simulated contextual gain predictor:
-///    p_t^(l) = W_p^(l) u_t ≈ σ′(S_{t-1} k_t)
-///
-/// 5. Residual initialization:
-///    r_t^(1) = v_t - u_t ≈ v_t - σ(S_{t-1} k_t)
-///
-/// 6. Iterative refinement:
-///    δ_t^(l) = GELU(p_t^(l) ⊙ r_t^(l))
-///    r_t^(l+1) = r_t^(l) - δ_t^(l)
-///
-/// 7. Forget operator:
-///    A_t = I - β_t^(1) · (k_t^(1) ⊗ k_t^(1))
-///
-/// 8. State update with decoupling:
-///    S_t = α_t S_{t-1} (I - β_t^(1) k_t^(1) ⊗ k_t^(1)) + Σ_{l=1..L} β_t^(l) · (δ_t^(l) ⊗ k_t^(l))
-///
+fn sigmoid(x: f32) f32 {
+    if (x >= 0.0) {
+        const z = @exp(-x);
+        return 1.0 / (1.0 + z);
+    }
+    const z = @exp(x);
+    return z / (1.0 + z);
+}
+
+fn geluApprox(x: f32) f32 {
+    const c: f32 = 0.7978845608028654;
+    const k: f32 = 0.044715;
+    const x2 = x * x;
+    const inner = c * (x + k * x * x2);
+    return 0.5 * x * (1.0 + std.math.tanh(inner));
+}
+
+fn geluApproxDerivative(x: f32) f32 {
+    const c: f32 = 0.7978845608028654;
+    const k: f32 = 0.044715;
+    const x2 = x * x;
+    const inner = c * (x + k * x * x2);
+    const t = std.math.tanh(inner);
+    const sech2 = 1.0 - t * t;
+    const inner_prime = c * (1.0 + 3.0 * k * x2);
+    return 0.5 * (1.0 + t) + 0.5 * x * sech2 * inner_prime;
+}
+
+fn zeroSlice(slice: []f32) void {
+    for (slice) |*v| {
+        v.* = 0.0;
+    }
+}
+
+fn copySlice(dst: []f32, src: []const f32) void {
+    for (dst, src) |*d, s| {
+        d.* = s;
+    }
+}
+
+fn normalizeInPlace(vec: []f32) void {
+    var norm_sq: f32 = 0.0;
+    for (vec) |v| {
+        norm_sq += v * v;
+    }
+    if (norm_sq <= 1.0e-12) {
+        return;
+    }
+    const inv_norm = 1.0 / @sqrt(norm_sq);
+    for (vec) |*v| {
+        v.* *= inv_norm;
+    }
+}
+
+fn projectTokenInto(dst: []f32, weight: *Tensor, token_ptr: anytype, token_offset: usize, hidden_dim: usize, head_dim: usize) void {
+    const weight_ptr = weight.typedPtr(dtype_mod.BF16).?;
+    for (0..head_dim) |j| {
+        var sum: f32 = 0.0;
+        for (0..hidden_dim) |i| {
+            sum += token_ptr[token_offset + i].toFloat32() * weight_ptr[i * head_dim + j].toFloat32();
+        }
+        dst[j] = sum;
+    }
+}
+
+fn accumulateMatVecTransposeToInput(grad_input: []f32, weight: *Tensor, grad_output: []const f32, hidden_dim: usize, head_dim: usize) void {
+    const weight_ptr = weight.typedPtr(dtype_mod.BF16).?;
+    for (0..hidden_dim) |i| {
+        var sum: f32 = 0.0;
+        for (0..head_dim) |j| {
+            sum += weight_ptr[i * head_dim + j].toFloat32() * grad_output[j];
+        }
+        grad_input[i] += sum;
+    }
+}
+
+fn computeStateTimesKey(dst: []f32, state: []const f32, key: []const f32, head_dim: usize) void {
+    for (0..head_dim) |row| {
+        var sum: f32 = 0.0;
+        for (0..head_dim) |col| {
+            sum += state[row * head_dim + col] * key[col];
+        }
+        dst[row] = sum;
+    }
+}
+
+fn applyForgetAndUpdate(dst: []f32, src: []const f32, state_times_key: []const f32, delta: []const f32, key: []const f32, head_dim: usize, alpha: f32, beta: f32) void {
+    for (0..head_dim) |row| {
+        for (0..head_dim) |col| {
+            dst[row * head_dim + col] = alpha * src[row * head_dim + col] - alpha * beta * state_times_key[row] * key[col] + beta * delta[row] * key[col];
+        }
+    }
+}
+
+fn applyAdditiveUpdate(dst: []f32, src: []const f32, delta: []const f32, key: []const f32, head_dim: usize, beta: f32) void {
+    for (0..head_dim) |row| {
+        for (0..head_dim) |col| {
+            dst[row * head_dim + col] = src[row * head_dim + col] + beta * delta[row] * key[col];
+        }
+    }
+}
+
 pub const PrismLayer = struct {
-    /// Configuration
     config: config_mod.PrismConfig,
-    /// Hidden dimension
     hidden_dim: usize,
-    /// Number of iterations (L)
     num_iterations: usize,
-    /// Head dimension
     head_dim: usize,
-    /// ShortConv layer
     shortconv: *ShortConv,
-    /// Beta projections per iteration
     w_beta: []*Tensor,
-    /// Key projections per iteration
     w_k: []*Tensor,
-    /// Proxy projections per iteration
     w_p: []*Tensor,
-    /// Forget factor (alpha)
     alpha: f32,
-    /// Allocator
     allocator: std.mem.Allocator,
-    /// Device
     device: tensor_mod.Device,
-    /// Device ID
     device_id: i32,
 
-    /// Initialize PRISM layer
     pub fn init(
         allocator: std.mem.Allocator,
         config: config_mod.PrismConfig,
@@ -74,13 +133,18 @@ pub const PrismLayer = struct {
         device_id: i32,
         rng: *std.Random,
     ) !*PrismLayer {
+        if (hidden_dim == 0) return error.InvalidHiddenDimension;
+        if (head_dim == 0) return error.InvalidHeadDimension;
+        if (head_dim > hidden_dim) return error.InvalidHeadDimension;
+        if (config.num_iterations == 0) return error.InvalidNumIterations;
+        if (config.shortconv_window == 0) return error.InvalidShortConvWindow;
+
         const self = try allocator.create(PrismLayer);
         errdefer allocator.destroy(self);
 
         const num_iterations = config.num_iterations;
         const scale = @sqrt(2.0 / @as(f64, @floatFromInt(hidden_dim)));
 
-        // Initialize ShortConv
         const shortconv = try ShortConv.init(
             allocator,
             hidden_dim,
@@ -91,37 +155,50 @@ pub const PrismLayer = struct {
         );
         errdefer shortconv.deinit();
 
-        // Initialize projection weights per iteration
         var w_beta = try allocator.alloc(*Tensor, num_iterations);
         errdefer allocator.free(w_beta);
-        errdefer {
-            for (w_beta) |w| w.deinit();
-        }
 
         var w_k = try allocator.alloc(*Tensor, num_iterations);
         errdefer allocator.free(w_k);
-        errdefer {
-            for (w_k) |w| w.deinit();
-        }
 
         var w_p = try allocator.alloc(*Tensor, num_iterations);
         errdefer allocator.free(w_p);
+
+        var beta_initialized: usize = 0;
+        var k_initialized: usize = 0;
+        var p_initialized: usize = 0;
+
         errdefer {
-            for (w_p) |w| w.deinit();
+            var i: usize = 0;
+            while (i < beta_initialized) : (i += 1) {
+                w_beta[i].deinit();
+            }
+        }
+        errdefer {
+            var i: usize = 0;
+            while (i < k_initialized) : (i += 1) {
+                w_k[i].deinit();
+            }
+        }
+        errdefer {
+            var i: usize = 0;
+            while (i < p_initialized) : (i += 1) {
+                w_p[i].deinit();
+            }
         }
 
         for (0..num_iterations) |l| {
-            // W_beta: hidden_dim -> head_dim
             const beta_shape = Shape.init(&[_]usize{ hidden_dim, head_dim });
             w_beta[l] = try Tensor.randNormal(allocator, beta_shape, .bf16, device, device_id, rng, 0.0, @floatCast(scale));
+            beta_initialized += 1;
 
-            // W_k: hidden_dim -> head_dim
             const k_shape = Shape.init(&[_]usize{ hidden_dim, head_dim });
             w_k[l] = try Tensor.randNormal(allocator, k_shape, .bf16, device, device_id, rng, 0.0, @floatCast(scale));
+            k_initialized += 1;
 
-            // W_p: hidden_dim -> head_dim
             const p_shape = Shape.init(&[_]usize{ hidden_dim, head_dim });
             w_p[l] = try Tensor.randNormal(allocator, p_shape, .bf16, device, device_id, rng, 0.0, @floatCast(scale));
+            p_initialized += 1;
         }
 
         self.* = .{
@@ -145,9 +222,15 @@ pub const PrismLayer = struct {
     pub fn deinit(self: *PrismLayer) void {
         self.shortconv.deinit();
 
-        for (self.w_beta) |w| w.deinit();
-        for (self.w_k) |w| w.deinit();
-        for (self.w_p) |w| w.deinit();
+        for (self.w_beta) |w| {
+            w.deinit();
+        }
+        for (self.w_k) |w| {
+            w.deinit();
+        }
+        for (self.w_p) |w| {
+            w.deinit();
+        }
 
         self.allocator.free(self.w_beta);
         self.allocator.free(self.w_k);
@@ -156,33 +239,38 @@ pub const PrismLayer = struct {
         self.allocator.destroy(self);
     }
 
-    /// Forward pass through PRISM layer
-    ///
-    /// Args:
-    ///   input: (batch, seq_len, hidden_dim) - Input hidden states
-    ///   v: (batch, seq_len, hidden_dim) - Value tensor from EFLA
-    ///   state: Previous PRISM state
-    ///
-    /// Returns:
-    ///   output: (batch, seq_len, hidden_dim)
-    ///   new_state: Updated PRISM state
+    fn validateForwardInputs(self: *PrismLayer, input: *Tensor, v: *Tensor, state: ?*PrismState) !void {
+        if (input.shape.dim(2) != self.hidden_dim) return error.InvalidInputShape;
+        if (v.shape.dim(0) != input.shape.dim(0)) return error.InvalidValueShape;
+        if (v.shape.dim(1) != input.shape.dim(1)) return error.InvalidValueShape;
+        if (v.shape.dim(2) != self.hidden_dim) return error.InvalidValueShape;
+
+        if (state) |s| {
+            if (s.state_dim != self.head_dim) return error.InvalidStateShape;
+            if (s.value_dim != self.head_dim) return error.InvalidStateShape;
+            if (s.state.shape.dim(0) != input.shape.dim(0)) return error.InvalidStateShape;
+            if (s.state.shape.dim(1) != self.head_dim) return error.InvalidStateShape;
+            if (s.state.shape.dim(2) != self.head_dim) return error.InvalidStateShape;
+        }
+    }
+
     pub fn forward(
         self: *PrismLayer,
         input: *Tensor,
         v: *Tensor,
         state: ?*PrismState,
     ) !struct { output: *Tensor, new_state: *PrismState } {
+        try self.validateForwardInputs(input, v, state);
+
         const batch_size = input.shape.dim(0);
         const seq_len = input.shape.dim(1);
 
-        // 1. Compute input-anchored proxy: u_t = ShortConv(X_{≤t})
         const u = try self.shortconv.forward(input);
         defer u.deinit();
 
-        // 2. Initialize new state
         var new_state = try PrismState.init(
             self.allocator,
-            1, // Single state for simplicity
+            batch_size,
             self.head_dim,
             self.head_dim,
             self.device,
@@ -190,13 +278,10 @@ pub const PrismLayer = struct {
         );
         errdefer new_state.deinit();
 
-        // 3. Initialize output tensor
         const output_shape = Shape.init(&[_]usize{ batch_size, seq_len, self.hidden_dim });
         var output = try Tensor.zeros(self.allocator, output_shape, .bf16, self.device, self.device_id);
         errdefer output.deinit();
 
-        // 4. Compute iterative refinement
-        // This is done via CUDA kernel for efficiency
         if (self.device == .cuda) {
             try self.prismForwardCuda(u, v, state, new_state, output);
         } else {
@@ -206,7 +291,6 @@ pub const PrismLayer = struct {
         return .{ .output = output, .new_state = new_state };
     }
 
-    /// CUDA forward pass
     fn prismForwardCuda(
         self: *PrismLayer,
         u: *Tensor,
@@ -215,11 +299,12 @@ pub const PrismLayer = struct {
         new_state: *PrismState,
         output: *Tensor,
     ) !void {
-        // Get weight pointers
         var w_beta_ptrs = try self.allocator.alloc(?*const anyopaque, self.num_iterations);
         defer self.allocator.free(w_beta_ptrs);
+
         var w_k_ptrs = try self.allocator.alloc(?*const anyopaque, self.num_iterations);
         defer self.allocator.free(w_k_ptrs);
+
         var w_p_ptrs = try self.allocator.alloc(?*const anyopaque, self.num_iterations);
         defer self.allocator.free(w_p_ptrs);
 
@@ -238,8 +323,8 @@ pub const PrismLayer = struct {
             w_beta_ptrs.ptr,
             w_k_ptrs.ptr,
             w_p_ptrs.ptr,
-            u.shape.dim(0), // batch_size
-            u.shape.dim(1), // seq_len
+            u.shape.dim(0),
+            u.shape.dim(1),
             self.hidden_dim,
             self.head_dim,
             self.num_iterations,
@@ -247,7 +332,6 @@ pub const PrismLayer = struct {
         );
     }
 
-    /// CPU forward pass (for testing)
     fn prismForwardCpu(
         self: *PrismLayer,
         u: *Tensor,
@@ -261,68 +345,116 @@ pub const PrismLayer = struct {
 
         const u_ptr = u.typedPtr(dtype_mod.BF16).?;
         const v_ptr = v.typedPtr(dtype_mod.BF16).?;
-        const o_ptr = output.typedPtr(dtype_mod.BF16).?;
+        const out_ptr = output.typedPtr(dtype_mod.BF16).?;
+        const new_state_ptr = new_state.state.typedPtr(dtype_mod.BF16).?;
+        const prev_state_ptr = if (prev_state) |s| s.state.typedPtr(dtype_mod.BF16).? else null;
+
+        const total_output_elems = batch_size * seq_len * self.hidden_dim;
+        for (0..total_output_elems) |i| {
+            out_ptr[i] = u_ptr[i];
+        }
+
+        var current_state = try self.allocator.alloc(f32, self.head_dim * self.head_dim);
+        defer self.allocator.free(current_state);
+
+        var next_state = try self.allocator.alloc(f32, self.head_dim * self.head_dim);
+        defer self.allocator.free(next_state);
+
+        var state_times_key = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(state_times_key);
+
+        var residual = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(residual);
+
+        var refined = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(refined);
+
+        var beta_proj = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(beta_proj);
+
+        var key_vec = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(key_vec);
+
+        var p_vec = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(p_vec);
+
+        var delta = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(delta);
 
         for (0..batch_size) |b| {
-            for (0..seq_len) |t| {
-                const offset = b * seq_len * self.hidden_dim + t * self.hidden_dim;
+            zeroSlice(current_state);
 
-                // Initialize residual: r^(1) = v - u
-                var residual = try self.allocator.alloc(f32, self.head_dim);
-                defer self.allocator.free(residual);
+            if (prev_state_ptr) |ps| {
+                for (0..self.head_dim) |row| {
+                    for (0..self.head_dim) |col| {
+                        const idx = b * self.head_dim * self.head_dim + row * self.head_dim + col;
+                        current_state[row * self.head_dim + col] = ps[idx].toFloat32();
+                    }
+                }
+            }
+
+            for (0..seq_len) |t| {
+                const token_offset = (b * seq_len + t) * self.hidden_dim;
+
+                zeroSlice(refined);
 
                 for (0..self.head_dim) |d| {
-                    residual[d] = v_ptr[offset + d].toFloat32() - u_ptr[offset + d].toFloat32();
+                    residual[d] = v_ptr[token_offset + d].toFloat32() - u_ptr[token_offset + d].toFloat32();
                 }
 
-                // Iterate through refinement steps
                 for (0..self.num_iterations) |l| {
-                    // β_t^(l) = W_beta^(l) u_t
-                    // Simplified: using scalar beta for now
-                    const beta: f32 = 0.5;
+                    projectTokenInto(beta_proj, self.w_beta[l], u_ptr, token_offset, self.hidden_dim, self.head_dim);
 
-                    // k_t^(l) = W_k^(l) u_t (simplified)
-                    const k_ptr = self.w_k[l].typedPtr(dtype_mod.BF16).?;
+                    var beta_sum: f32 = 0.0;
+                    for (beta_proj) |v_beta| {
+                        beta_sum += v_beta;
+                    }
+                    const beta_scalar = sigmoid(beta_sum / @as(f32, @floatFromInt(self.head_dim)));
 
-                    // p_t^(l) = W_p^(l) u_t (simplified)
-                    const p_ptr = self.w_p[l].typedPtr(dtype_mod.BF16).?;
+                    projectTokenInto(key_vec, self.w_k[l], u_ptr, token_offset, self.hidden_dim, self.head_dim);
+                    normalizeInPlace(key_vec);
 
-                    // δ_t^(l) = GELU(p_t^(l) ⊙ r_t^(l))
-                    var delta = try self.allocator.alloc(f32, self.head_dim);
-                    defer self.allocator.free(delta);
+                    projectTokenInto(p_vec, self.w_p[l], u_ptr, token_offset, self.hidden_dim, self.head_dim);
+                    for (0..self.head_dim) |d| {
+                        p_vec[d] = sigmoid(p_vec[d]);
+                    }
 
                     for (0..self.head_dim) |d| {
-                        const p_val = p_ptr[d].toFloat32(); // Simplified
-                        const r_val = residual[d];
-                        const gelu_input = p_val * r_val;
-                        // GELU approximation
-                        const x = gelu_input;
-                        delta[d] = 0.5 * x * (1.0 + std.math.tanh(std.math.sqrt(2.0 / std.math.pi) * (x + 0.044715 * x * x * x)));
+                        const z = p_vec[d] * residual[d];
+                        delta[d] = geluApprox(z);
                     }
 
-                    // Accumulate to output
-                    for (0..self.hidden_dim) |d| {
-                        if (d < self.head_dim) {
-                            const current = o_ptr[offset + d].toFloat32();
-                            o_ptr[offset + d] = dtype_mod.BF16.fromFloat32(current + beta * delta[d]);
-                        }
+                    if (l == 0) {
+                        computeStateTimesKey(state_times_key, current_state, key_vec, self.head_dim);
+                        applyForgetAndUpdate(next_state, current_state, state_times_key, delta, key_vec, self.head_dim, self.alpha, beta_scalar);
+                    } else {
+                        applyAdditiveUpdate(next_state, current_state, delta, key_vec, self.head_dim, beta_scalar);
                     }
 
-                    // Update residual: r^(l+1) = r^(l) - δ^(l)
                     for (0..self.head_dim) |d| {
                         residual[d] -= delta[d];
+                        refined[d] += delta[d];
                     }
+
+                    const tmp = current_state;
+                    current_state = next_state;
+                    next_state = tmp;
                 }
 
-                // Apply forget operator to state
-                // S_t = α S_{t-1} (I - β k ⊗ k) + ...
-                _ = prev_state;
-                _ = new_state;
+                for (0..self.head_dim) |d| {
+                    out_ptr[token_offset + d] = dtype_mod.BF16.fromFloat32(u_ptr[token_offset + d].toFloat32() + refined[d]);
+                }
+            }
+
+            for (0..self.head_dim) |row| {
+                for (0..self.head_dim) |col| {
+                    const idx = b * self.head_dim * self.head_dim + row * self.head_dim + col;
+                    new_state_ptr[idx] = dtype_mod.BF16.fromFloat32(current_state[row * self.head_dim + col]);
+                }
             }
         }
     }
 
-    /// Backward pass
     pub fn backward(
         self: *PrismLayer,
         grad_output: *Tensor,
@@ -330,47 +462,170 @@ pub const PrismLayer = struct {
         v: *Tensor,
         state: *PrismState,
     ) !struct { grad_input: *Tensor, grad_v: *Tensor, grad_state: *PrismState } {
-        _ = grad_output;
-        _ = input;
-        _ = v;
-        _ = state;
+        if (self.device != .cpu) return error.UnsupportedDevice;
+        if (grad_output.shape.dim(0) != input.shape.dim(0)) return error.InvalidGradientShape;
+        if (grad_output.shape.dim(1) != input.shape.dim(1)) return error.InvalidGradientShape;
+        if (grad_output.shape.dim(2) != self.hidden_dim) return error.InvalidGradientShape;
+        try self.validateForwardInputs(input, v, state);
 
-        // Backprop through PRISM requires careful gradient computation
-        // through the iterative refinement process
+        const batch_size = input.shape.dim(0);
+        const seq_len = input.shape.dim(1);
+        const total_elems = batch_size * seq_len * self.hidden_dim;
+
+        const u = try self.shortconv.forward(input);
+        defer u.deinit();
+
+        const grad_output_ptr = grad_output.typedPtr(dtype_mod.BF16).?;
+        const u_ptr = u.typedPtr(dtype_mod.BF16).?;
+        const v_ptr = v.typedPtr(dtype_mod.BF16).?;
+        const weight_ptr = self.shortconv.weight.typedPtr(dtype_mod.BF16).?;
 
         const grad_input_shape = input.shape;
-        const grad_input = try Tensor.zeros(self.allocator, grad_input_shape, .bf16, self.device, self.device_id);
+        var grad_input = try Tensor.zeros(self.allocator, grad_input_shape, .bf16, self.device, self.device_id);
+        errdefer grad_input.deinit();
 
-        const grad_v = try Tensor.zeros(self.allocator, v.shape, .bf16, self.device, self.device_id);
+        var grad_v = try Tensor.zeros(self.allocator, v.shape, .bf16, self.device, self.device_id);
+        errdefer grad_v.deinit();
 
-        const grad_state = try PrismState.init(
+        var grad_state = try PrismState.init(
             self.allocator,
-            1,
+            state.state.shape.dim(0),
             self.head_dim,
             self.head_dim,
             self.device,
             self.device_id,
         );
+        errdefer grad_state.deinit();
+
+        const grad_input_ptr = grad_input.typedPtr(dtype_mod.BF16).?;
+        const grad_v_ptr = grad_v.typedPtr(dtype_mod.BF16).?;
+        const grad_state_ptr = grad_state.state.typedPtr(dtype_mod.BF16).?;
+
+        for (0..state.state.shape.dim(0) * self.head_dim * self.head_dim) |i| {
+            grad_state_ptr[i] = dtype_mod.BF16.fromFloat32(0.0);
+        }
+
+        var grad_u = try self.allocator.alloc(f32, total_elems);
+        defer self.allocator.free(grad_u);
+        zeroSlice(grad_u);
+
+        var residual_before_cache = try self.allocator.alloc(f32, self.num_iterations * self.head_dim);
+        defer self.allocator.free(residual_before_cache);
+
+        var p_cache = try self.allocator.alloc(f32, self.num_iterations * self.head_dim);
+        defer self.allocator.free(p_cache);
+
+        var gelu_input_cache = try self.allocator.alloc(f32, self.num_iterations * self.head_dim);
+        defer self.allocator.free(gelu_input_cache);
+
+        var residual = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(residual);
+
+        var p_vec = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(p_vec);
+
+        var grad_residual_next = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(grad_residual_next);
+
+        var grad_residual_before = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(grad_residual_before);
+
+        var grad_linear = try self.allocator.alloc(f32, self.head_dim);
+        defer self.allocator.free(grad_linear);
+
+        var token_grad_u = try self.allocator.alloc(f32, self.hidden_dim);
+        defer self.allocator.free(token_grad_u);
+
+        for (0..total_elems) |i| {
+            grad_v_ptr[i] = dtype_mod.BF16.fromFloat32(0.0);
+        }
+
+        for (0..batch_size) |b| {
+            for (0..seq_len) |t| {
+                const token_offset = (b * seq_len + t) * self.hidden_dim;
+
+                for (0..self.hidden_dim) |d| {
+                    token_grad_u[d] = grad_output_ptr[token_offset + d].toFloat32();
+                }
+
+                for (0..self.head_dim) |d| {
+                    residual[d] = v_ptr[token_offset + d].toFloat32() - u_ptr[token_offset + d].toFloat32();
+                }
+
+                for (0..self.num_iterations) |l| {
+                    projectTokenInto(p_vec, self.w_p[l], u_ptr, token_offset, self.hidden_dim, self.head_dim);
+
+                    for (0..self.head_dim) |d| {
+                        const cache_idx = l * self.head_dim + d;
+                        residual_before_cache[cache_idx] = residual[d];
+                        p_cache[cache_idx] = sigmoid(p_vec[d]);
+                        gelu_input_cache[cache_idx] = p_cache[cache_idx] * residual[d];
+                        residual[d] -= geluApprox(gelu_input_cache[cache_idx]);
+                    }
+                }
+
+                zeroSlice(grad_residual_next);
+
+                var l_rev: usize = self.num_iterations;
+                while (l_rev > 0) {
+                    l_rev -= 1;
+
+                    for (0..self.head_dim) |d| {
+                        const cache_idx = l_rev * self.head_dim + d;
+                        const grad_delta = grad_output_ptr[token_offset + d].toFloat32() - grad_residual_next[d];
+                        const grad_z = grad_delta * geluApproxDerivative(gelu_input_cache[cache_idx]);
+                        const p = p_cache[cache_idx];
+                        const r_before = residual_before_cache[cache_idx];
+                        grad_linear[d] = (grad_z * r_before) * p * (1.0 - p);
+                        grad_residual_before[d] = grad_residual_next[d] + grad_z * p;
+                    }
+
+                    accumulateMatVecTransposeToInput(token_grad_u, self.w_p[l_rev], grad_linear, self.hidden_dim, self.head_dim);
+
+                    for (0..self.head_dim) |d| {
+                        grad_residual_next[d] = grad_residual_before[d];
+                    }
+                }
+
+                for (0..self.head_dim) |d| {
+                    token_grad_u[d] -= grad_residual_next[d];
+                    const current_grad_v = grad_v_ptr[token_offset + d].toFloat32();
+                    grad_v_ptr[token_offset + d] = dtype_mod.BF16.fromFloat32(current_grad_v + grad_residual_next[d]);
+                }
+
+                for (0..self.hidden_dim) |d| {
+                    grad_u[token_offset + d] = token_grad_u[d];
+                }
+            }
+        }
+
+        for (0..batch_size) |b| {
+            for (0..seq_len) |t| {
+                for (0..self.hidden_dim) |d| {
+                    var sum: f32 = 0.0;
+                    for (0..self.shortconv.window_size) |w| {
+                        const out_t = t + w;
+                        if (out_t < seq_len) {
+                            const grad_u_idx = (b * seq_len + out_t) * self.hidden_dim + d;
+                            sum += grad_u[grad_u_idx] * weight_ptr[d * self.shortconv.window_size + w].toFloat32();
+                        }
+                    }
+                    grad_input_ptr[(b * seq_len + t) * self.hidden_dim + d] = dtype_mod.BF16.fromFloat32(sum);
+                }
+            }
+        }
 
         return .{ .grad_input = grad_input, .grad_v = grad_v, .grad_state = grad_state };
     }
 };
 
-/// ShortConv - Causal convolution over recent tokens
 pub const ShortConv = struct {
-    /// Window size
     window_size: usize,
-    /// Hidden dimension
     hidden_dim: usize,
-    /// Convolution weights
     weight: *Tensor,
-    /// Bias (optional)
     bias: ?*Tensor,
-    /// Allocator
     allocator: std.mem.Allocator,
-    /// Device
     device: tensor_mod.Device,
-    /// Device ID
     device_id: i32,
 
     pub fn init(
@@ -381,10 +636,12 @@ pub const ShortConv = struct {
         device_id: i32,
         rng: *std.Random,
     ) !*ShortConv {
+        if (hidden_dim == 0) return error.InvalidHiddenDimension;
+        if (window_size == 0) return error.InvalidWindowSize;
+
         const self = try allocator.create(ShortConv);
         errdefer allocator.destroy(self);
 
-        // Weight shape: (hidden_dim, window_size)
         const weight_shape = Shape.init(&[_]usize{ hidden_dim, window_size });
         const weight = try Tensor.randNormal(
             allocator,
@@ -413,14 +670,15 @@ pub const ShortConv = struct {
 
     pub fn deinit(self: *ShortConv) void {
         self.weight.deinit();
-        if (self.bias) |b| b.deinit();
+        if (self.bias) |b| {
+            b.deinit();
+        }
         self.allocator.destroy(self);
     }
 
-    /// Forward pass
-    /// input: (batch, seq_len, hidden_dim)
-    /// output: (batch, seq_len, hidden_dim)
     pub fn forward(self: *ShortConv, input: *Tensor) !*Tensor {
+        if (input.shape.dim(2) != self.hidden_dim) return error.InvalidInputShape;
+
         const batch_size = input.shape.dim(0);
         const seq_len = input.shape.dim(1);
 
@@ -429,6 +687,7 @@ pub const ShortConv = struct {
         errdefer output.deinit();
 
         if (self.device == .cuda) {
+            if (self.bias != null) return error.UnsupportedBiasConfiguration;
             try kernels.shortConvForwardCuda(
                 input.ptr(),
                 self.weight.ptr(),
@@ -452,39 +711,41 @@ pub const ShortConv = struct {
         const input_ptr = input.typedPtr(dtype_mod.BF16).?;
         const weight_ptr = self.weight.typedPtr(dtype_mod.BF16).?;
         const output_ptr = output.typedPtr(dtype_mod.BF16).?;
+        const bias_ptr = if (self.bias) |b| blk: {
+            if (b.shape.dim(0) != self.hidden_dim) return error.InvalidBiasShape;
+            break :blk b.typedPtr(dtype_mod.BF16).?;
+        } else null;
 
         for (0..batch_size) |b| {
             for (0..seq_len) |t| {
                 for (0..self.hidden_dim) |d| {
                     var sum: f32 = 0.0;
 
-                    // Causal convolution: only look at positions <= t
                     for (0..self.window_size) |w| {
                         const lookback = @as(isize, @intCast(t)) - @as(isize, @intCast(w));
                         if (lookback >= 0) {
                             const t_lookback = @as(usize, @intCast(lookback));
-                            const input_val = input_ptr[b * seq_len * self.hidden_dim + t_lookback * self.hidden_dim + d].toFloat32();
+                            const input_val = input_ptr[(b * seq_len + t_lookback) * self.hidden_dim + d].toFloat32();
                             const weight_val = weight_ptr[d * self.window_size + w].toFloat32();
                             sum += input_val * weight_val;
                         }
                     }
 
-                    output_ptr[b * seq_len * self.hidden_dim + t * self.hidden_dim + d] = dtype_mod.BF16.fromFloat32(sum);
+                    if (bias_ptr) |bp| {
+                        sum += bp[d].toFloat32();
+                    }
+
+                    output_ptr[(b * seq_len + t) * self.hidden_dim + d] = dtype_mod.BF16.fromFloat32(sum);
                 }
             }
         }
     }
 };
 
-/// PRISM State
 pub const PrismState = struct {
-    /// State matrix
     state: *Tensor,
-    /// State dimension
     state_dim: usize,
-    /// Value dimension
     value_dim: usize,
-    /// Allocator
     allocator: std.mem.Allocator,
 
     pub fn init(
@@ -495,6 +756,10 @@ pub const PrismState = struct {
         device: tensor_mod.Device,
         device_id: i32,
     ) !*PrismState {
+        if (num_states == 0) return error.InvalidNumStates;
+        if (state_dim == 0) return error.InvalidStateDimension;
+        if (value_dim == 0) return error.InvalidValueDimension;
+
         const self = try allocator.create(PrismState);
         errdefer allocator.destroy(self);
 
