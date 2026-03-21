@@ -1,15 +1,21 @@
 const std = @import("std");
 
-pub extern "cuda_nn" fn rmsNormForwardCuda(
+pub const EflaDType = c_int;
+pub const EflaReduction = c_int;
+pub const CudaStream = ?*anyopaque;
+
+pub extern fn rmsnorm_forward_cuda(
     input: ?*const anyopaque,
     weight: ?*const anyopaque,
     output: ?*anyopaque,
     numel: usize,
     normalized_shape: usize,
+    tensor_dtype: EflaDType,
     eps: f32,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_nn" fn rmsNormBackwardCuda(
+pub extern fn rmsnorm_backward_cuda(
     grad_output: ?*const anyopaque,
     input: ?*const anyopaque,
     weight: ?*const anyopaque,
@@ -17,34 +23,44 @@ pub extern "cuda_nn" fn rmsNormBackwardCuda(
     grad_weight: ?*anyopaque,
     numel: usize,
     normalized_shape: usize,
+    tensor_dtype: EflaDType,
+    grad_weight_dtype: EflaDType,
     eps: f32,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_nn" fn layerNormForwardCuda(
+pub extern fn layernorm_forward_cuda(
     input: ?*const anyopaque,
     weight: ?*const anyopaque,
     bias: ?*const anyopaque,
     output: ?*anyopaque,
     numel: usize,
     normalized_shape: usize,
+    tensor_dtype: EflaDType,
     eps: f32,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_nn" fn geluForwardCuda(
+pub extern fn gelu_forward_cuda(
     input: ?*const anyopaque,
     output: ?*anyopaque,
     numel: usize,
+    tensor_dtype: EflaDType,
     approximate: bool,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_nn" fn softmaxForwardCuda(
+pub extern fn softmax_forward_cuda(
     input: ?*const anyopaque,
     output: ?*anyopaque,
-    numel: usize,
+    outer_size: usize,
     dim_size: usize,
+    inner_size: usize,
+    tensor_dtype: EflaDType,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_nn" fn gemmForwardCuda(
+pub extern fn gemm_forward_cuda(
     a: ?*const anyopaque,
     b: ?*const anyopaque,
     bias: ?*const anyopaque,
@@ -52,9 +68,13 @@ pub extern "cuda_nn" fn gemmForwardCuda(
     m: usize,
     k: usize,
     n: usize,
+    dtype_a: EflaDType,
+    dtype_b: EflaDType,
+    dtype_c: EflaDType,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_nn" fn gemmBackwardCuda(
+pub extern fn gemm_backward_cuda(
     grad_c: ?*const anyopaque,
     a: ?*const anyopaque,
     b: ?*const anyopaque,
@@ -64,33 +84,52 @@ pub extern "cuda_nn" fn gemmBackwardCuda(
     m: usize,
     k: usize,
     n: usize,
+    grad_c_dtype: EflaDType,
+    a_dtype: EflaDType,
+    b_dtype: EflaDType,
+    grad_a_dtype: EflaDType,
+    grad_b_dtype: EflaDType,
+    grad_bias_dtype: EflaDType,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_nn" fn crossEntropyForwardCuda(
+pub extern fn cross_entropy_forward_cuda(
     logits: ?*const anyopaque,
-    targets: ?*const anyopaque,
+    targets: ?*const i32,
     loss: ?*anyopaque,
     batch_size: usize,
     vocab_size: usize,
+    logits_dtype: EflaDType,
+    loss_dtype: EflaDType,
     label_smoothing: f32,
+    reduction: EflaReduction,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_nn" fn crossEntropyBackwardCuda(
+pub extern fn cross_entropy_backward_cuda(
     grad_loss: ?*const anyopaque,
     logits: ?*const anyopaque,
-    targets: ?*const anyopaque,
+    targets: ?*const i32,
     grad_logits: ?*anyopaque,
     batch_size: usize,
     vocab_size: usize,
+    grad_loss_dtype: EflaDType,
+    logits_dtype: EflaDType,
+    grad_logits_dtype: EflaDType,
     label_smoothing: f32,
+    reduction: EflaReduction,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_nn" fn embeddingForwardCuda(
-    indices: ?*const anyopaque,
+pub extern fn embedding_forward_cuda(
+    indices: ?*const i32,
     weight: ?*const anyopaque,
     output: ?*anyopaque,
     num_indices: usize,
     embedding_dim: usize,
+    weight_dtype: EflaDType,
+    output_dtype: EflaDType,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
 fn requireEqual(actual: usize, expected: usize, name: []const u8) void {

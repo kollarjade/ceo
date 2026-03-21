@@ -1,6 +1,9 @@
 const std = @import("std");
 
-pub extern "cuda_prism" fn prismForwardCuda(
+pub const EflaDType = c_int;
+pub const CudaStream = ?*anyopaque;
+
+pub extern fn prism_forward_cuda(
     u: ?*const anyopaque,
     v: ?*const anyopaque,
     prev_state: ?*const anyopaque,
@@ -14,24 +17,12 @@ pub extern "cuda_prism" fn prismForwardCuda(
     hidden_dim: usize,
     head_dim: usize,
     num_iterations: usize,
+    tensor_dtype: EflaDType,
     alpha: f32,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_prism" fn prismBackwardCuda(
-    grad_output: ?*const anyopaque,
-    u: ?*const anyopaque,
-    v: ?*const anyopaque,
-    state: ?*const anyopaque,
-    grad_u: ?*anyopaque,
-    grad_v: ?*anyopaque,
-    grad_state: ?*anyopaque,
-    batch_size: usize,
-    seq_len: usize,
-    hidden_dim: usize,
-    num_iterations: usize,
-) callconv(.C) c_int;
-
-pub extern "cuda_prism" fn shortConvForwardCuda(
+pub extern fn shortconv_forward_cuda(
     input: ?*const anyopaque,
     weight: ?*const anyopaque,
     output: ?*anyopaque,
@@ -39,18 +30,8 @@ pub extern "cuda_prism" fn shortConvForwardCuda(
     seq_len: usize,
     hidden_dim: usize,
     window_size: usize,
-) callconv(.C) c_int;
-
-pub extern "cuda_prism" fn shortConvBackwardCuda(
-    grad_output: ?*const anyopaque,
-    input: ?*const anyopaque,
-    weight: ?*const anyopaque,
-    grad_input: ?*anyopaque,
-    grad_weight: ?*anyopaque,
-    batch_size: usize,
-    seq_len: usize,
-    hidden_dim: usize,
-    window_size: usize,
+    tensor_dtype: EflaDType,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
 fn checkedMul(a: usize, b: usize) usize {

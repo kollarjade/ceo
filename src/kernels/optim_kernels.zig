@@ -1,67 +1,82 @@
 const std = @import("std");
 
-pub extern "cuda_optim" fn lionStepCuda(
+pub const EflaDType = c_int;
+pub const EflaFp8Format = c_int;
+pub const EflaMemoryKind = c_int;
+pub const CudaStream = ?*anyopaque;
+
+pub extern fn lion_step_cuda(
     param: ?*anyopaque,
     grad: ?*const anyopaque,
     momentum: ?*anyopaque,
     numel: usize,
+    tensor_dtype: EflaDType,
     lr: f32,
     beta1: f32,
     beta2: f32,
     weight_decay: f32,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_optim" fn muonStepCuda(
+pub extern fn muon_step_cuda(
     param: ?*anyopaque,
     grad: ?*const anyopaque,
     momentum: ?*anyopaque,
     m: usize,
     n: usize,
+    tensor_dtype: EflaDType,
     lr: f32,
     beta: f32,
     ns_iterations: usize,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_optim" fn adamWStepCuda(
+pub extern fn adamw_step_cuda(
     param: ?*anyopaque,
     grad: ?*const anyopaque,
     exp_avg: ?*anyopaque,
     exp_avg_sq: ?*anyopaque,
     numel: usize,
+    tensor_dtype: EflaDType,
     lr: f32,
     beta1: f32,
     beta2: f32,
     eps: f32,
     weight_decay: f32,
     step: usize,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_optim" fn clipGradNormCuda(
+pub extern fn clip_grad_norm_cuda(
     grads: [*]?*anyopaque,
-    num_params: usize,
     numels: [*]const usize,
+    num_params: usize,
+    tensor_dtype: EflaDType,
     max_norm: f32,
     global_norm: *f32,
+    global_norm_memory_kind: EflaMemoryKind,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_optim" fn clipGradValueCuda(
-    grad: ?*anyopaque,
-    numel: usize,
-    max_value: f32,
-) callconv(.C) c_int;
-
-pub extern "cuda_optim" fn quantizeFP8Cuda(
+pub extern fn quantize_fp8_cuda(
     input: ?*const anyopaque,
     output: ?*anyopaque,
     scale: *f32,
     numel: usize,
+    input_dtype: EflaDType,
+    output_format: EflaFp8Format,
+    scale_memory_kind: EflaMemoryKind,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_optim" fn dequantizeFP8Cuda(
+pub extern fn dequantize_fp8_cuda(
     input: ?*const anyopaque,
     output: ?*anyopaque,
     scale: f32,
     numel: usize,
+    input_format: EflaFp8Format,
+    output_dtype: EflaDType,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
 fn checkedMul(a: usize, b: usize) usize {
@@ -161,7 +176,10 @@ pub fn newtonSchulzIteration(
     const nn = checkedMul(n, n);
 
     if (Y.len < mn) @panic("invalid Y length");
-    if (temp.len < nn) @panic("invalid temp length");
+    if (temp.len < nn + mn) @panic("invalid temp length");
+
+    const gram = temp[0..nn];
+    const Y_new = temp[nn .. nn + mn];
 
     for (0..n) |i| {
         for (0..n) |j| {
@@ -169,25 +187,22 @@ pub fn newtonSchulzIteration(
             for (0..m) |k| {
                 sum += Y[k * n + i] * Y[k * n + j];
             }
-            temp[i * n + j] = sum;
+            gram[i * n + j] = sum;
         }
     }
 
     for (0..n) |i| {
         for (0..n) |j| {
             const identity: f32 = if (i == j) 3.0 else 0.0;
-            temp[i * n + j] = identity - temp[i * n + j];
+            gram[i * n + j] = identity - gram[i * n + j];
         }
     }
-
-    var Y_new = std.heap.page_allocator.alloc(f32, mn) catch @panic("out of memory");
-    defer std.heap.page_allocator.free(Y_new);
 
     for (0..m) |i| {
         for (0..n) |j| {
             var sum: f32 = 0.0;
             for (0..n) |k| {
-                sum += Y[i * n + k] * temp[k * n + j];
+                sum += Y[i * n + k] * gram[k * n + j];
             }
             Y_new[i * n + j] = @as(f32, 0.5) * sum;
         }

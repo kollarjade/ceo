@@ -1,38 +1,53 @@
 const std = @import("std");
 
-pub extern "cuda_efla" fn eflaForwardCuda(
+pub const EflaDType = c_int;
+pub const CudaStream = ?*anyopaque;
+
+pub extern fn efla_forward_cuda(
     k: ?*const anyopaque,
     v: ?*const anyopaque,
-    state: ?*anyopaque,
+    initial_state: ?*const anyopaque,
+    final_state: ?*anyopaque,
     output: ?*anyopaque,
     batch_size: usize,
     seq_len: usize,
     num_heads: usize,
     head_dim: usize,
+    tensor_dtype: EflaDType,
     beta: f32,
+    lambda: f32,
     chunk_size: usize,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_efla" fn eflaBackwardCuda(
+pub extern fn efla_backward_cuda(
     grad_output: ?*const anyopaque,
     k: ?*const anyopaque,
     v: ?*const anyopaque,
-    state: ?*const anyopaque,
+    initial_state: ?*const anyopaque,
+    final_state: ?*const anyopaque,
     grad_k: ?*anyopaque,
     grad_v: ?*anyopaque,
-    grad_state: ?*anyopaque,
+    grad_initial_state: ?*anyopaque,
     batch_size: usize,
     seq_len: usize,
     num_heads: usize,
     head_dim: usize,
+    tensor_dtype: EflaDType,
     beta: f32,
+    lambda: f32,
+    chunk_size: usize,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
-pub extern "cuda_efla" fn eflaChunkedScanCuda(
+pub extern fn efla_chunked_scan_cuda(
     chunk_states: [*]?*anyopaque,
     num_chunks: usize,
+    batch_size: usize,
     num_heads: usize,
     head_dim: usize,
+    state_dtype: EflaDType,
+    stream: CudaStream,
 ) callconv(.C) c_int;
 
 fn squareLen(head_dim: usize) usize {
@@ -54,6 +69,9 @@ pub fn computeCoefficient(lambda: f32, beta: f32) f32 {
             - @as(f32, 0.5) * beta2 * lambda
             + (@as(f32, 1.0) / @as(f32, 6.0)) * beta3 * lambda2
             - (@as(f32, 1.0) / @as(f32, 24.0)) * beta4 * lambda2 * lambda;
+    }
+    if (lambda == 0.0) {
+        return beta;
     }
     return (@as(f32, 1.0) - @exp(-x)) / lambda;
 }
@@ -98,12 +116,12 @@ pub fn eflaComputeOutput(
     requireEqual(k.len, head_dim);
     requireEqual(output.len, head_dim);
 
-    for (0..head_dim) |i| {
+    for (0..head_dim) |j| {
         var sum: f32 = 0.0;
-        for (0..head_dim) |j| {
-            sum += state[i * head_dim + j] * k[j];
+        for (0..head_dim) |i| {
+            sum += k[i] * state[i * head_dim + j];
         }
-        output[i] = sum;
+        output[j] = sum;
     }
 }
 
