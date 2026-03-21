@@ -41,6 +41,12 @@ pub const OpLayout = enum(u8) {
     prefer_tensor_core,
 };
 
+fn checkedRoundUp(value: usize, multiple: usize) usize {
+    if (multiple == 0) return value;
+    const incremented = std.math.add(usize, value, multiple - 1) catch @panic("size overflow");
+    return (incremented / multiple) * multiple;
+}
+
 pub const PaddingStrategy = struct {
     alignment: usize,
     pad_to_multiple: usize,
@@ -55,8 +61,8 @@ pub const PaddingStrategy = struct {
     pub fn paddedSize(self: PaddingStrategy, size: usize) usize {
         const align_val = if (self.alignment == 0) 1 else self.alignment;
         const mult_val = if (self.pad_to_multiple == 0) 1 else self.pad_to_multiple;
-        const aligned = (size + align_val - 1) / align_val * align_val;
-        return (aligned + mult_val - 1) / mult_val * mult_val;
+        const aligned = checkedRoundUp(size, align_val);
+        return checkedRoundUp(aligned, mult_val);
     }
 
     pub fn default() PaddingStrategy {
@@ -75,14 +81,13 @@ pub const PaddingStrategy = struct {
 };
 
 pub fn padDimension(dim: usize, multiple: usize) usize {
-    if (multiple == 0) return dim;
-    return (dim + multiple - 1) / multiple * multiple;
+    return checkedRoundUp(dim, multiple);
 }
 
 pub fn optimalLeadingDimension(dim: usize, dtype_size: usize) usize {
     if (dtype_size == 0) return dim;
     const elements_per_128_bytes = if (dtype_size > 128) 1 else 128 / dtype_size;
-    return (dim + elements_per_128_bytes - 1) / elements_per_128_bytes * elements_per_128_bytes;
+    return checkedRoundUp(dim, elements_per_128_bytes);
 }
 
 pub const TensorCoreTiles = struct {
@@ -122,10 +127,13 @@ pub const MemoryPool = struct {
             .device_id = device_id,
             .allocator = allocator,
         };
+        errdefer pool.deinit();
 
         if (initial_size > 0) {
-            const aligned_initial = (initial_size + 127) & ~@as(usize, 127);
+            const aligned_initial = checkedRoundUp(initial_size, 128);
             const buf = try allocator.alignedAlloc(u8, 128, aligned_initial);
+            errdefer allocator.free(buf);
+
             try pool.buffers.append(buf);
             try pool.blocks.append(.{
                 .ptr = buf.ptr,
@@ -148,34 +156,32 @@ pub const MemoryPool = struct {
 
     pub fn allocate(self: *MemoryPool, size: usize) ![*]u8 {
         if (size == 0) return error.InvalidSize;
-        const aligned_size = (size + 127) & ~@as(usize, 127);
+        const aligned_size = checkedRoundUp(size, 128);
 
         var best_idx: ?usize = null;
         var best_size: usize = std.math.maxInt(usize);
 
         for (self.blocks.items, 0..) |block, i| {
-            if (!block.in_use and block.size >= aligned_size) {
-                if (block.size < best_size) {
-                    best_size = block.size;
-                    best_idx = i;
-                }
+            if (!block.in_use and block.size >= aligned_size and block.size < best_size) {
+                best_size = block.size;
+                best_idx = i;
             }
         }
 
         if (best_idx) |idx| {
-            const block = &self.blocks.items[idx];
-            if (block.size > aligned_size) {
-                const remaining_size = block.size - aligned_size;
-                const new_ptr = block.ptr + aligned_size;
-                block.size = aligned_size;
-                block.in_use = true;
+            const original = self.blocks.items[idx];
+            if (original.size > aligned_size) {
+                const remaining_size = original.size - aligned_size;
+                const new_ptr = original.ptr + aligned_size;
                 try self.blocks.insert(idx + 1, .{
                     .ptr = new_ptr,
                     .size = remaining_size,
                     .in_use = false,
                 });
+                self.blocks.items[idx].size = aligned_size;
+                self.blocks.items[idx].in_use = true;
             } else {
-                block.in_use = true;
+                self.blocks.items[idx].in_use = true;
             }
             self.used_size += aligned_size;
             return self.blocks.items[idx].ptr;
@@ -184,27 +190,27 @@ pub const MemoryPool = struct {
         const min_alloc = 16 * 1024 * 1024;
         const alloc_size = if (aligned_size > min_alloc) aligned_size else min_alloc;
         const buf = try self.allocator.alignedAlloc(u8, 128, alloc_size);
+        errdefer self.allocator.free(buf);
+
         try self.buffers.append(buf);
-        self.total_size += alloc_size;
+        errdefer _ = self.buffers.pop();
+
+        try self.blocks.append(.{
+            .ptr = buf.ptr,
+            .size = aligned_size,
+            .in_use = true,
+        });
+        errdefer _ = self.blocks.pop();
 
         if (alloc_size > aligned_size) {
-            try self.blocks.append(.{
-                .ptr = buf.ptr,
-                .size = aligned_size,
-                .in_use = true,
-            });
             try self.blocks.append(.{
                 .ptr = buf.ptr + aligned_size,
                 .size = alloc_size - aligned_size,
                 .in_use = false,
             });
-        } else {
-            try self.blocks.append(.{
-                .ptr = buf.ptr,
-                .size = alloc_size,
-                .in_use = true,
-            });
         }
+
+        self.total_size += alloc_size;
         self.used_size += aligned_size;
         return buf.ptr;
     }
@@ -219,6 +225,7 @@ pub const MemoryPool = struct {
                 return;
             }
         }
+        @panic("invalid pointer");
     }
 
     pub fn defragment(self: *MemoryPool) !void {
@@ -257,9 +264,9 @@ test "MemoryPool basic operations" {
 
     const ptr1 = try pool.allocate(100);
     const ptr2 = try pool.allocate(200);
-    
+
     pool.free(ptr1);
     pool.free(ptr2);
-    
+
     try pool.defragment();
 }
