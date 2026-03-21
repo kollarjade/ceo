@@ -140,6 +140,9 @@ pub const ScaleFactor = struct {
         if (max_amax > 0.0) {
             self.scale = target_max / max_amax;
             self.inv_scale = max_amax / target_max;
+        } else {
+            self.scale = 1.0;
+            self.inv_scale = 1.0;
         }
     }
 };
@@ -257,9 +260,9 @@ pub const FP8_E4M3 = packed struct(u8) {
             }
         }
 
-        if (fp8_exp > 15 or (fp8_exp == 15 and fp8_mant >= 7)) {
+        if (fp8_exp > 15 or (fp8_exp == 15 and fp8_mant >= 6)) {
             fp8_exp = 15;
-            fp8_mant = 6;
+            fp8_mant = 5;
         }
 
         return .{ .sign = sign, .exponent = @intCast(fp8_exp), .mantissa = @intCast(fp8_mant) };
@@ -268,6 +271,10 @@ pub const FP8_E4M3 = packed struct(u8) {
     pub fn toFloat32(self: FP8_E4M3) f32 {
         if (self.exponent == 15 and self.mantissa == 7) {
             const bits: u32 = (@as(u32, self.sign) << 31) | 0x7FC00000;
+            return @bitCast(bits);
+        }
+        if (self.exponent == 15 and self.mantissa == 6) {
+            const bits: u32 = (@as(u32, self.sign) << 31) | 0x7F800000;
             return @bitCast(bits);
         }
         if (self.exponent == 0) {
@@ -634,6 +641,14 @@ fn writeFP4(bytes: []u8, index: usize, val: f32) void {
     }
 }
 
+fn slicesOverlap(a: []const u8, b: []const u8) bool {
+    const a_start = @intFromPtr(a.ptr);
+    const a_end = a_start +% a.len;
+    const b_start = @intFromPtr(b.ptr);
+    const b_end = b_start +% b.len;
+    return a_start < b_end and b_start < a_end;
+}
+
 pub fn castSlice(comptime from: DType, comptime to: DType, input: []const u8, output: []u8) !void {
     const from_bits = from.bitSize();
     const to_bits = to.bitSize();
@@ -650,35 +665,35 @@ pub fn castSlice(comptime from: DType, comptime to: DType, input: []const u8, ou
         if ((n + 1) / 2 > output.len) return error.InvalidOutputLength;
     }
 
-    const in_start = @intFromPtr(input.ptr);
-    const in_end = in_start +% input.len;
-    const out_start = @intFromPtr(output.ptr);
-    const out_end = out_start +% output.len;
-    if (in_start < out_end and out_start < in_end) {
-        if (input.ptr != output.ptr or input.len != output.len or from != to) {
-            return error.OverlappingMemory;
-        }
-    }
+    var owned_input: ?[]u8 = null;
+    defer if (owned_input) |buf| std.heap.page_allocator.free(buf);
+
+    const input_bytes: []const u8 = if (slicesOverlap(input, output) and (input.ptr != output.ptr or input.len != output.len or from != to)) blk: {
+        const tmp = try std.heap.page_allocator.alloc(u8, input.len);
+        @memcpy(tmp, input);
+        owned_input = tmp;
+        break :blk tmp;
+    } else input;
 
     if (from == to and from_bits >= 8) {
-        if (input.ptr != output.ptr) {
-            @memcpy(output[0..input.len], input);
+        if (input_bytes.ptr != output.ptr) {
+            @memcpy(output[0..input_bytes.len], input_bytes);
         }
         return;
     }
 
     for (0..n) |i| {
         const val_f64: f64 = switch (from) {
-            .fp32 => @as(f64, readUnaligned(f32, input, i)),
-            .fp16 => @as(f64, readUnaligned(FP16, input, i).toFloat32()),
-            .bf16 => @as(f64, readUnaligned(BF16, input, i).toFloat32()),
-            .fp8_e4m3 => @as(f64, readUnaligned(FP8_E4M3, input, i).toFloat32()),
-            .fp8_e5m2 => @as(f64, readUnaligned(FP8_E5M2, input, i).toFloat32()),
-            .fp4 => @as(f64, readFP4(input, i)),
-            .int8 => @floatFromInt(readUnaligned(i8, input, i)),
-            .int32 => @floatFromInt(readUnaligned(i32, input, i)),
-            .int64 => @floatFromInt(readUnaligned(i64, input, i)),
-            .bool_ => if (readUnaligned(u8, input, i) != 0) @as(f64, 1.0) else @as(f64, 0.0),
+            .fp32 => @as(f64, readUnaligned(f32, input_bytes, i)),
+            .fp16 => @as(f64, readUnaligned(FP16, input_bytes, i).toFloat32()),
+            .bf16 => @as(f64, readUnaligned(BF16, input_bytes, i).toFloat32()),
+            .fp8_e4m3 => @as(f64, readUnaligned(FP8_E4M3, input_bytes, i).toFloat32()),
+            .fp8_e5m2 => @as(f64, readUnaligned(FP8_E5M2, input_bytes, i).toFloat32()),
+            .fp4 => @as(f64, readFP4(input_bytes, i)),
+            .int8 => @floatFromInt(readUnaligned(i8, input_bytes, i)),
+            .int32 => @floatFromInt(readUnaligned(i32, input_bytes, i)),
+            .int64 => @floatFromInt(readUnaligned(i64, input_bytes, i)),
+            .bool_ => if (readUnaligned(u8, input_bytes, i) != 0) @as(f64, 1.0) else @as(f64, 0.0),
         };
 
         switch (to) {
@@ -741,7 +756,7 @@ test "FP8_E4M3 roundtrip" {
         if (std.math.isNan(v)) {
             try std.testing.expect(std.math.isNan(back));
         } else if (std.math.isInf(v)) {
-            try std.testing.expectEqual(@as(f32, if (v > 0) 448.0 else -448.0), back);
+            try std.testing.expect(std.math.isInf(back));
         } else {
             try std.testing.expectEqual(v, back);
         }
