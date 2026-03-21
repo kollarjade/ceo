@@ -37,120 +37,24 @@ fn readTimerMillis(timer: *std.time.Timer) u64 {
     return @as(u64, @intCast(timer.read() / std.time.ns_per_ms));
 }
 
+fn freeNames(allocator: std.mem.Allocator, names: []const []const u8) void {
+    for (names) |name| allocator.free(name);
+    allocator.free(names);
+}
+
 fn loadCheckpointIntoModel(allocator: std.mem.Allocator, model: *model_mod.EflaModel, checkpoint_path: []const u8) !void {
-    if (checkpoint_path.len == 0) {
-        return;
-    }
+    if (checkpoint_path.len == 0) return;
 
-    if (@hasDecl(model_mod.EflaModel, "loadCheckpoint")) {
-        const method = model_mod.EflaModel.loadCheckpoint;
-        const info = @typeInfo(@TypeOf(method)).Fn;
-        if (info.params.len == 2) {
-            try @call(.auto, method, .{ model, checkpoint_path });
-            return;
-        }
-        if (info.params.len == 3) {
-            try @call(.auto, method, .{ model, allocator, checkpoint_path });
-            return;
-        }
-        @compileError("Unsupported EflaModel.loadCheckpoint signature");
-    }
+    var manager = try checkpoint_mod.CheckpointManager.init(allocator, ".", 1, false);
+    defer manager.deinit();
 
-    if (@hasDecl(model_mod.EflaModel, "loadFromCheckpoint")) {
-        const method = model_mod.EflaModel.loadFromCheckpoint;
-        const info = @typeInfo(@TypeOf(method)).Fn;
-        if (info.params.len == 2) {
-            try @call(.auto, method, .{ model, checkpoint_path });
-            return;
-        }
-        if (info.params.len == 3) {
-            try @call(.auto, method, .{ model, allocator, checkpoint_path });
-            return;
-        }
-        @compileError("Unsupported EflaModel.loadFromCheckpoint signature");
-    }
+    const params = try model.collectParameters(allocator);
+    defer allocator.free(params);
 
-    if (@hasDecl(checkpoint_mod, "loadCheckpoint")) {
-        const method = checkpoint_mod.loadCheckpoint;
-        const info = @typeInfo(@TypeOf(method)).Fn;
-        if (info.params.len == 2) {
-            try @call(.auto, method, .{ model, checkpoint_path });
-            return;
-        }
-        if (info.params.len == 3) {
-            try @call(.auto, method, .{ allocator, model, checkpoint_path });
-            return;
-        }
-        @compileError("Unsupported checkpoint_mod.loadCheckpoint signature");
-    }
+    const names = try model.getParameterNames(allocator);
+    defer freeNames(allocator, names);
 
-    if (@hasDecl(checkpoint_mod, "loadModel")) {
-        const method = checkpoint_mod.loadModel;
-        const info = @typeInfo(@TypeOf(method)).Fn;
-        if (info.params.len == 2) {
-            try @call(.auto, method, .{ model, checkpoint_path });
-            return;
-        }
-        if (info.params.len == 3) {
-            try @call(.auto, method, .{ allocator, model, checkpoint_path });
-            return;
-        }
-        @compileError("Unsupported checkpoint_mod.loadModel signature");
-    }
-
-    if (@hasDecl(checkpoint_mod, "CheckpointManager")) {
-        const Manager = checkpoint_mod.CheckpointManager;
-        if (@hasDecl(Manager, "init")) {
-            const init_fn = Manager.init;
-            const init_info = @typeInfo(@TypeOf(init_fn)).Fn;
-
-            if (init_info.params.len == 1) {
-                var manager = try @call(.auto, init_fn, .{ allocator });
-                defer manager.deinit();
-
-                if (@hasDecl(Manager, "loadModel")) {
-                    const method = Manager.loadModel;
-                    const info = @typeInfo(@TypeOf(method)).Fn;
-                    if (info.params.len == 3) {
-                        try @call(.auto, method, .{ &manager, model, checkpoint_path });
-                        return;
-                    }
-                    if (info.params.len == 2) {
-                        try @call(.auto, method, .{ &manager, model });
-                        return;
-                    }
-                    @compileError("Unsupported CheckpointManager.loadModel signature");
-                }
-
-                @compileError("CheckpointManager exists but has no supported loadModel method");
-            }
-
-            if (init_info.params.len == 2) {
-                var manager = try @call(.auto, init_fn, .{ allocator, checkpoint_path });
-                defer manager.deinit();
-
-                if (@hasDecl(Manager, "loadModel")) {
-                    const method = Manager.loadModel;
-                    const info = @typeInfo(@TypeOf(method)).Fn;
-                    if (info.params.len == 2) {
-                        try @call(.auto, method, .{ &manager, model });
-                        return;
-                    }
-                    if (info.params.len == 3) {
-                        try @call(.auto, method, .{ &manager, model, checkpoint_path });
-                        return;
-                    }
-                    @compileError("Unsupported CheckpointManager.loadModel signature");
-                }
-
-                @compileError("CheckpointManager exists but has no supported loadModel method");
-            }
-
-            @compileError("Unsupported CheckpointManager.init signature");
-        }
-    }
-
-    @compileError("No supported checkpoint loading API found");
+    _ = try manager.load(checkpoint_path, params, names);
 }
 
 fn resolveBatchTokenCount(batch: anytype) usize {
@@ -168,13 +72,13 @@ fn resolveBatchTokenCount(batch: anytype) usize {
             const shape = input_ids.shape;
             const ShapeType = @TypeOf(shape);
 
-            if (@hasField(ShapeType, "dims")) {
-                const dims = shape.dims;
-                if (dims.len >= 2) {
-                    return @as(usize, @intCast(dims[0])) * @as(usize, @intCast(dims[1]));
+            if (@hasField(ShapeType, "ndim") and @hasField(ShapeType, "dims")) {
+                const ndim = shape.ndim;
+                if (ndim >= 2) {
+                    return @as(usize, @intCast(shape.dims[0])) * @as(usize, @intCast(shape.dims[1]));
                 }
-                if (dims.len == 1) {
-                    return @as(usize, @intCast(dims[0]));
+                if (ndim == 1) {
+                    return @as(usize, @intCast(shape.dims[0]));
                 }
             }
         }
@@ -197,12 +101,10 @@ fn resolveBatchTokenCount(batch: anytype) usize {
 
 fn deinitBatch(batch: anytype, allocator: std.mem.Allocator) void {
     const BatchType = @TypeOf(batch.*);
-
     if (@hasDecl(BatchType, "deinit")) {
         batch.deinit(allocator);
         return;
     }
-
     @compileError("Unsupported data_mod.Batch layout: missing deinit");
 }
 
@@ -299,14 +201,7 @@ fn tokenizerEncode(allocator: std.mem.Allocator, config: Config, text: []const u
         return try model_mod.encode(allocator, text);
     }
 
-    var out = try allocator.alloc(u32, text.len);
-    errdefer allocator.free(out);
-
-    for (text, 0..) |c, i| {
-        out[i] = @as(u32, c);
-    }
-
-    return out;
+    return error.UnsupportedTokenizer;
 }
 
 fn tokenizerDecode(allocator: std.mem.Allocator, config: Config, tokens: []const u32) ![]u8 {
@@ -324,14 +219,7 @@ fn tokenizerDecode(allocator: std.mem.Allocator, config: Config, tokens: []const
         return try model_mod.decode(allocator, tokens);
     }
 
-    var out = try allocator.alloc(u8, tokens.len);
-    errdefer allocator.free(out);
-
-    for (tokens, 0..) |t, i| {
-        out[i] = @as(u8, @intCast(@min(t, 255)));
-    }
-
-    return out;
+    return error.UnsupportedTokenizer;
 }
 
 const ProbIndexSortContext = struct {
@@ -344,23 +232,24 @@ const ProbIndexSortContext = struct {
 
 pub const Evaluator = struct {
     config: Config,
-    model: model_mod.EflaModel,
+    model: *model_mod.EflaModel,
     allocator: std.mem.Allocator,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, config: Config, checkpoint_path: []const u8) !Self {
         var prng = std.Random.DefaultPrng.init(randomSeed());
-        var model = try model_mod.EflaModel.init(
+        var rng = prng.random();
+        const model = try model_mod.EflaModel.init(
             allocator,
             config.model,
             .cpu,
             0,
-            prng.random(),
+            &rng,
         );
         errdefer model.deinit();
 
-        try loadCheckpointIntoModel(allocator, &model, checkpoint_path);
+        try loadCheckpointIntoModel(allocator, model, checkpoint_path);
 
         return .{
             .config = config,
@@ -374,7 +263,7 @@ pub const Evaluator = struct {
     }
 
     fn computeLoss(self: *Self, batch: *const data_mod.Batch) !f64 {
-        return try forwardLossFromModel(&self.model, self.allocator, batch);
+        return try forwardLossFromModel(self.model, self.allocator, batch);
     }
 
     pub fn evaluatePerplexity(self: *Self, data_path: []const u8, max_tokens: usize) !EvalResults {
@@ -402,46 +291,26 @@ pub const Evaluator = struct {
             defer deinitBatch(&batch, self.allocator);
 
             const batch_tokens = resolveBatchTokenCount(&batch);
-            if (batch_tokens == 0) {
-                continue;
-            }
-
-            var effective_tokens = batch_tokens;
-            if (max_tokens > 0 and total_tokens + effective_tokens > max_tokens) {
-                effective_tokens = max_tokens - total_tokens;
-            }
-
-            if (effective_tokens == 0) {
-                break;
-            }
+            if (batch_tokens == 0) continue;
+            if (max_tokens > 0 and total_tokens + batch_tokens > max_tokens) break;
 
             const avg_loss = try self.computeLoss(&batch);
-            total_loss += avg_loss * @as(f64, @floatFromInt(effective_tokens));
-            total_tokens += effective_tokens;
+            total_loss += avg_loss * @as(f64, @floatFromInt(batch_tokens));
+            total_tokens += batch_tokens;
             batches += 1;
 
-            if (max_tokens > 0 and total_tokens >= max_tokens) {
-                break;
-            }
+            if (max_tokens > 0 and total_tokens >= max_tokens) break;
         }
 
         const duration_ms = readTimerMillis(&timer);
 
         if (total_tokens == 0) {
-            return .{
-                .perplexity = 0.0,
-                .loss = 0.0,
-                .tokens = 0,
-                .batches = 0,
-                .duration_ms = duration_ms,
-            };
+            return .{ .perplexity = 0.0, .loss = 0.0, .tokens = 0, .batches = 0, .duration_ms = duration_ms };
         }
 
         const mean_loss = total_loss / @as(f64, @floatFromInt(total_tokens));
-        const perplexity = std.math.exp(mean_loss);
-
         return .{
-            .perplexity = perplexity,
+            .perplexity = std.math.exp(mean_loss),
             .loss = mean_loss,
             .tokens = total_tokens,
             .batches = batches,
@@ -454,9 +323,7 @@ pub const Evaluator = struct {
         errdefer self.allocator.free(results);
 
         for (context_lengths, 0..) |ctx_len, i| {
-            if (ctx_len == 0) {
-                return error.InvalidContextLength;
-            }
+            if (ctx_len == 0) return error.InvalidContextLength;
 
             var dataset = try data_mod.BinaryDataset.open(self.allocator, data_path);
             defer dataset.close();
@@ -472,7 +339,6 @@ pub const Evaluator = struct {
             defer loader.deinit();
 
             var timer = try startTimer();
-
             var total_loss: f64 = 0.0;
             var total_tokens: usize = 0;
             var batches: usize = 0;
@@ -482,9 +348,7 @@ pub const Evaluator = struct {
                 defer deinitBatch(&batch, self.allocator);
 
                 const batch_tokens = resolveBatchTokenCount(&batch);
-                if (batch_tokens == 0) {
-                    continue;
-                }
+                if (batch_tokens == 0) continue;
 
                 const avg_loss = try self.computeLoss(&batch);
                 total_loss += avg_loss * @as(f64, @floatFromInt(batch_tokens));
@@ -495,13 +359,7 @@ pub const Evaluator = struct {
             const duration_ms = readTimerMillis(&timer);
 
             if (total_tokens == 0) {
-                results[i] = .{
-                    .perplexity = 0.0,
-                    .loss = 0.0,
-                    .tokens = 0,
-                    .batches = 0,
-                    .duration_ms = duration_ms,
-                };
+                results[i] = .{ .perplexity = 0.0, .loss = 0.0, .tokens = 0, .batches = 0, .duration_ms = duration_ms };
             } else {
                 const mean_loss = total_loss / @as(f64, @floatFromInt(total_tokens));
                 results[i] = .{
@@ -520,7 +378,7 @@ pub const Evaluator = struct {
 
 pub const Generator = struct {
     config: Config,
-    model: model_mod.EflaModel,
+    model: *model_mod.EflaModel,
     allocator: std.mem.Allocator,
     rng: std.Random.DefaultPrng,
     sample_probs: std.ArrayListUnmanaged(f32),
@@ -530,16 +388,17 @@ pub const Generator = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Config, checkpoint_path: []const u8) !Self {
         var prng = std.Random.DefaultPrng.init(randomSeed());
-        var model = try model_mod.EflaModel.init(
+        var rng = prng.random();
+        const model = try model_mod.EflaModel.init(
             allocator,
             config.model,
             .cpu,
             0,
-            prng.random(),
+            &rng,
         );
         errdefer model.deinit();
 
-        try loadCheckpointIntoModel(allocator, &model, checkpoint_path);
+        try loadCheckpointIntoModel(allocator, model, checkpoint_path);
 
         return .{
             .config = config,
@@ -575,23 +434,18 @@ pub const Generator = struct {
 
         var step: usize = 0;
         while (step < max_new_tokens) : (step += 1) {
-            const logits = try modelForwardLogits(&self.model, self.allocator, tokens.items);
+            const logits = try modelForwardLogits(self.model, self.allocator, tokens.items);
             defer self.allocator.free(logits);
-
-            if (logits.len == 0) {
-                return error.EmptyLogits;
-            }
+            if (logits.len == 0) return error.EmptyLogits;
 
             var best_index: usize = 0;
             var best_value: f32 = logits[0];
-
             for (logits[1..], 1..) |v, i| {
                 if (v > best_value) {
                     best_value = v;
                     best_index = i;
                 }
             }
-
             try tokens.append(@as(u32, @intCast(best_index)));
         }
 
@@ -606,9 +460,8 @@ pub const Generator = struct {
 
         var step: usize = 0;
         while (step < max_new_tokens) : (step += 1) {
-            const logits = try modelForwardLogits(&self.model, self.allocator, tokens.items);
+            const logits = try modelForwardLogits(self.model, self.allocator, tokens.items);
             defer self.allocator.free(logits);
-
             const next_token = try self.sampleTopP(logits, temperature, top_p);
             try tokens.append(next_token);
         }
@@ -617,15 +470,9 @@ pub const Generator = struct {
     }
 
     pub fn sampleTopP(self: *Self, logits: []const f32, temperature: f32, top_p: f32) !u32 {
-        if (logits.len == 0) {
-            return error.EmptyLogits;
-        }
-        if (!std.math.isFinite(temperature) or temperature <= 0.0) {
-            return error.InvalidTemperature;
-        }
-        if (!std.math.isFinite(top_p) or top_p <= 0.0 or top_p > 1.0) {
-            return error.InvalidTopP;
-        }
+        if (logits.len == 0) return error.EmptyLogits;
+        if (!std.math.isFinite(temperature) or temperature <= 0.0) return error.InvalidTemperature;
+        if (!std.math.isFinite(top_p) or top_p <= 0.0 or top_p > 1.0) return error.InvalidTopP;
 
         try self.sample_probs.resize(self.allocator, logits.len);
         try self.sample_indices.resize(self.allocator, logits.len);
@@ -634,44 +481,28 @@ pub const Generator = struct {
         var indices = self.sample_indices.items;
 
         var max_logit: f32 = logits[0];
-        if (!std.math.isFinite(max_logit)) {
-            return error.NonFiniteLogit;
-        }
-
+        if (!std.math.isFinite(max_logit)) return error.NonFiniteLogit;
         for (logits[1..]) |v| {
-            if (!std.math.isFinite(v)) {
-                return error.NonFiniteLogit;
-            }
-            if (v > max_logit) {
-                max_logit = v;
-            }
+            if (!std.math.isFinite(v)) return error.NonFiniteLogit;
+            if (v > max_logit) max_logit = v;
         }
 
         var sum: f64 = 0.0;
         for (logits, 0..) |logit, i| {
             const scaled = (@as(f64, @floatCast(logit)) - @as(f64, @floatCast(max_logit))) / @as(f64, @floatCast(temperature));
             const p = std.math.exp(scaled);
-            if (!std.math.isFinite(p)) {
-                return error.NonFiniteProbability;
-            }
+            if (!std.math.isFinite(p)) return error.NonFiniteProbability;
             probs[i] = @as(f32, @floatCast(p));
             indices[i] = i;
             sum += p;
         }
-
-        if (!(sum > 0.0) or !std.math.isFinite(sum)) {
-            return error.InvalidProbabilityMass;
-        }
-
-        for (probs) |*p| {
-            p.* = @as(f32, @floatCast(@as(f64, p.*) / sum));
-        }
+        if (!(sum > 0.0) or !std.math.isFinite(sum)) return error.InvalidProbabilityMass;
+        for (probs) |*p| p.* = @as(f32, @floatCast(@as(f64, p.*) / sum));
 
         std.sort.heap(usize, indices, ProbIndexSortContext{ .probs = probs }, ProbIndexSortContext.lessThan);
 
         var nucleus_count: usize = 0;
         var nucleus_mass: f64 = 0.0;
-
         while (nucleus_count < indices.len) : (nucleus_count += 1) {
             nucleus_mass += @as(f64, probs[indices[nucleus_count]]);
             if (nucleus_mass >= @as(f64, @floatCast(top_p))) {
@@ -679,25 +510,19 @@ pub const Generator = struct {
                 break;
             }
         }
-
         if (nucleus_count == 0) {
             nucleus_count = 1;
             nucleus_mass = @as(f64, probs[indices[0]]);
         }
 
         var draw = self.rng.random().float(f64);
-        if (draw >= 1.0) {
-            draw = std.math.nextAfter(f64, 1.0, 0.0);
-        }
-
+        if (draw >= 1.0) draw = std.math.nextAfter(f64, 1.0, 0.0);
         const threshold = draw * nucleus_mass;
-        var cumulative: f64 = 0.0;
 
+        var cumulative: f64 = 0.0;
         for (indices[0..nucleus_count]) |token_index| {
             cumulative += @as(f64, probs[token_index]);
-            if (threshold <= cumulative) {
-                return @as(u32, @intCast(token_index));
-            }
+            if (threshold <= cumulative) return @as(u32, @intCast(token_index));
         }
 
         return @as(u32, @intCast(indices[nucleus_count - 1]));
@@ -709,72 +534,54 @@ pub fn benchmarkThroughput(allocator: std.mem.Allocator, config: Config, batch_s
     errdefer results.deinit();
 
     var prng = std.Random.DefaultPrng.init(randomSeed());
+    var rng = prng.random();
 
     for (batch_sizes) |batch_size| {
         for (seq_lengths) |seq_len| {
-            var model = try model_mod.EflaModel.init(
+            const model = try model_mod.EflaModel.init(
                 allocator,
                 config.model,
                 .cpu,
                 0,
-                prng.random(),
+                &rng,
             );
             defer model.deinit();
 
             const total_input_tokens = batch_size * seq_len;
-
             if (total_input_tokens == 0) {
-                try results.append(.{
-                    .batch_size = batch_size,
-                    .seq_len = seq_len,
-                    .throughput = 0.0,
-                });
+                try results.append(.{ .batch_size = batch_size, .seq_len = seq_len, .throughput = 0.0 });
                 continue;
             }
 
             var input = try allocator.alloc(u32, total_input_tokens);
             defer allocator.free(input);
 
-            const vocab_size: usize = if (@hasField(@TypeOf(config.model), "vocab_size"))
-                @as(usize, @intCast(config.model.vocab_size))
-            else
-                256;
-
+            const vocab_size: usize = if (@hasField(@TypeOf(config.model), "vocab_size")) @as(usize, @intCast(config.model.vocab_size)) else 256;
             const safe_vocab_size: usize = if (vocab_size == 0) 256 else vocab_size;
+            for (input, 0..) |*t, i| t.* = @as(u32, @intCast(i % safe_vocab_size));
 
-            for (input, 0..) |*t, i| {
-                t.* = @as(u32, @intCast(i % safe_vocab_size));
-            }
-
-            const warmup_iters: usize = 2;
             var warmup_step: usize = 0;
-            while (warmup_step < warmup_iters) : (warmup_step += 1) {
-                const logits = try modelForwardLogits(&model, allocator, input);
+            while (warmup_step < 2) : (warmup_step += 1) {
+                const logits = try modelForwardLogits(model, allocator, input);
                 allocator.free(logits);
             }
 
-            const measured_iters: usize = 10;
             var timer = try startTimer();
-
             var measured_step: usize = 0;
-            while (measured_step < measured_iters) : (measured_step += 1) {
-                const logits = try modelForwardLogits(&model, allocator, input);
+            while (measured_step < 10) : (measured_step += 1) {
+                const logits = try modelForwardLogits(model, allocator, input);
                 allocator.free(logits);
             }
 
             const elapsed_ns = timer.read();
-            if (elapsed_ns == 0) {
-                return error.InvalidBenchmarkDuration;
-            }
+            if (elapsed_ns == 0) return error.InvalidBenchmarkDuration;
 
-            const total_tokens = @as(f64, @floatFromInt(total_input_tokens * measured_iters));
+            const total_tokens = @as(f64, @floatFromInt(total_input_tokens * 10));
             const seconds = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
-            const throughput = total_tokens / seconds;
-
             try results.append(.{
                 .batch_size = batch_size,
                 .seq_len = seq_len,
-                .throughput = throughput,
+                .throughput = total_tokens / seconds,
             });
         }
     }
