@@ -1,17 +1,14 @@
 #ifndef EFLA_KERNELS_H
 #define EFLA_KERNELS_H
-
 #include <stddef.h>
 #include <stdint.h>
 #ifndef __cplusplus
 #include <stdbool.h>
 #endif
 #include <cuda_runtime.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
-
 typedef enum efla_dtype_t {
     EFLA_DTYPE_INVALID = 0,
     EFLA_DTYPE_FLOAT16 = 1,
@@ -23,34 +20,29 @@ typedef enum efla_dtype_t {
     EFLA_DTYPE_UINT8 = 7,
     EFLA_DTYPE_INT8 = 8
 } efla_dtype_t;
-
 typedef enum efla_fp8_format_t {
     EFLA_FP8_FORMAT_INVALID = 0,
     EFLA_FP8_FORMAT_E4M3 = 1,
     EFLA_FP8_FORMAT_E5M2 = 2
 } efla_fp8_format_t;
-
 typedef enum efla_reduction_t {
     EFLA_REDUCTION_INVALID = 0,
     EFLA_REDUCTION_NONE = 1,
     EFLA_REDUCTION_SUM = 2,
     EFLA_REDUCTION_MEAN = 3
 } efla_reduction_t;
-
 typedef enum efla_norm_kind_t {
     EFLA_NORM_KIND_INVALID = 0,
     EFLA_NORM_KIND_L1 = 1,
     EFLA_NORM_KIND_L2 = 2,
     EFLA_NORM_KIND_INF = 3
 } efla_norm_kind_t;
-
 typedef enum efla_memory_kind_t {
     EFLA_MEMORY_KIND_INVALID = 0,
     EFLA_MEMORY_KIND_HOST = 1,
     EFLA_MEMORY_KIND_DEVICE = 2,
     EFLA_MEMORY_KIND_MANAGED = 3
 } efla_memory_kind_t;
-
 #define EFLA_CUDA_RETURN_IF_ERROR(call) \
     do { \
         cudaError_t efla_cuda_status__ = (call); \
@@ -58,7 +50,6 @@ typedef enum efla_memory_kind_t {
             return efla_cuda_status__; \
         } \
     } while (0)
-
 #define EFLA_CUDA_GOTO_IF_ERROR(call, status_var, label) \
     do { \
         cudaError_t efla_cuda_status__ = (call); \
@@ -67,7 +58,6 @@ typedef enum efla_memory_kind_t {
             goto label; \
         } \
     } while (0)
-
 cudaError_t efla_forward_cuda(
     const void* k,
     const void* v,
@@ -84,7 +74,6 @@ cudaError_t efla_forward_cuda(
     size_t chunk_size,
     cudaStream_t stream
 );
-
 cudaError_t efla_backward_cuda(
     const void* grad_output,
     const void* k,
@@ -104,7 +93,6 @@ cudaError_t efla_backward_cuda(
     size_t chunk_size,
     cudaStream_t stream
 );
-
 cudaError_t efla_chunked_scan_cuda(
     void* const* chunk_states,
     size_t num_chunks,
@@ -114,7 +102,6 @@ cudaError_t efla_chunked_scan_cuda(
     efla_dtype_t state_dtype,
     cudaStream_t stream
 );
-
 cudaError_t prism_forward_cuda(
     const void* u,
     const void* v,
@@ -133,7 +120,6 @@ cudaError_t prism_forward_cuda(
     float alpha,
     cudaStream_t stream
 );
-
 cudaError_t shortconv_forward_cuda(
     const void* input,
     const void* weight,
@@ -145,7 +131,6 @@ cudaError_t shortconv_forward_cuda(
     efla_dtype_t tensor_dtype,
     cudaStream_t stream
 );
-
 cudaError_t rmsnorm_forward_cuda(
     const void* input,
     const void* weight,
@@ -156,7 +141,6 @@ cudaError_t rmsnorm_forward_cuda(
     float eps,
     cudaStream_t stream
 );
-
 cudaError_t rmsnorm_backward_cuda(
     const void* grad_output,
     const void* input,
@@ -170,7 +154,6 @@ cudaError_t rmsnorm_backward_cuda(
     float eps,
     cudaStream_t stream
 );
-
 cudaError_t layernorm_forward_cuda(
     const void* input,
     const void* weight,
@@ -182,7 +165,6 @@ cudaError_t layernorm_forward_cuda(
     float eps,
     cudaStream_t stream
 );
-
 cudaError_t gelu_forward_cuda(
     const void* input,
     void* output,
@@ -191,7 +173,6 @@ cudaError_t gelu_forward_cuda(
     bool approximate,
     cudaStream_t stream
 );
-
 cudaError_t gelu_backward_cuda(
     const void* grad_output,
     const void* input,
@@ -201,7 +182,6 @@ cudaError_t gelu_backward_cuda(
     bool approximate,
     cudaStream_t stream
 );
-
 cudaError_t softmax_forward_cuda(
     const void* input,
     void* output,
@@ -211,7 +191,6 @@ cudaError_t softmax_forward_cuda(
     efla_dtype_t tensor_dtype,
     cudaStream_t stream
 );
-
 cudaError_t gemm_forward_cuda(
     const void* a,
     const void* b,
@@ -225,7 +204,6 @@ cudaError_t gemm_forward_cuda(
     efla_dtype_t dtype_c,
     cudaStream_t stream
 );
-
 cudaError_t gemm_backward_cuda(
     const void* grad_c,
     const void* a,
@@ -244,7 +222,6 @@ cudaError_t gemm_backward_cuda(
     efla_dtype_t grad_bias_dtype,
     cudaStream_t stream
 );
-
 cudaError_t cross_entropy_forward_cuda(
     const void* logits,
     const int32_t* targets,
@@ -257,7 +234,6 @@ cudaError_t cross_entropy_forward_cuda(
     efla_reduction_t reduction,
     cudaStream_t stream
 );
-
 cudaError_t cross_entropy_backward_cuda(
     const void* grad_loss,
     const void* logits,
@@ -272,7 +248,6 @@ cudaError_t cross_entropy_backward_cuda(
     efla_reduction_t reduction,
     cudaStream_t stream
 );
-
 cudaError_t lion_step_cuda(
     void* param,
     const void* grad,
@@ -285,7 +260,6 @@ cudaError_t lion_step_cuda(
     float weight_decay,
     cudaStream_t stream
 );
-
 cudaError_t muon_step_cuda(
     void* param,
     const void* grad,
@@ -298,7 +272,6 @@ cudaError_t muon_step_cuda(
     size_t ns_iterations,
     cudaStream_t stream
 );
-
 cudaError_t adamw_step_cuda(
     void* param,
     const void* grad,
@@ -314,7 +287,6 @@ cudaError_t adamw_step_cuda(
     size_t step,
     cudaStream_t stream
 );
-
 cudaError_t clip_grad_norm_cuda(
     void** grads,
     const size_t* numels,
@@ -325,7 +297,6 @@ cudaError_t clip_grad_norm_cuda(
     efla_memory_kind_t global_norm_memory_kind,
     cudaStream_t stream
 );
-
 cudaError_t fill_cuda(
     void* ptr,
     float value,
@@ -333,7 +304,13 @@ cudaError_t fill_cuda(
     efla_dtype_t dtype,
     cudaStream_t stream
 );
-
+cudaError_t copy_cuda(
+    const void* src,
+    void* dst,
+    size_t numel,
+    size_t element_size,
+    cudaStream_t stream
+);
 cudaError_t cast_cuda(
     const void* src,
     void* dst,
@@ -342,7 +319,6 @@ cudaError_t cast_cuda(
     efla_dtype_t dst_dtype,
     cudaStream_t stream
 );
-
 cudaError_t embedding_forward_cuda(
     const int32_t* indices,
     const void* weight,
@@ -353,7 +329,6 @@ cudaError_t embedding_forward_cuda(
     efla_dtype_t output_dtype,
     cudaStream_t stream
 );
-
 cudaError_t quantize_fp8_cuda(
     const void* input,
     void* output,
@@ -364,7 +339,6 @@ cudaError_t quantize_fp8_cuda(
     efla_memory_kind_t scale_memory_kind,
     cudaStream_t stream
 );
-
 cudaError_t dequantize_fp8_cuda(
     const void* input,
     void* output,
@@ -374,7 +348,6 @@ cudaError_t dequantize_fp8_cuda(
     efla_dtype_t output_dtype,
     cudaStream_t stream
 );
-
 cudaError_t sum_reduce_cuda(
     const void* input,
     void* output,
@@ -382,7 +355,6 @@ cudaError_t sum_reduce_cuda(
     efla_dtype_t dtype,
     cudaStream_t stream
 );
-
 cudaError_t norm_cuda(
     const void* input,
     float* output,
@@ -392,9 +364,7 @@ cudaError_t norm_cuda(
     efla_memory_kind_t output_memory_kind,
     cudaStream_t stream
 );
-
 #ifdef __cplusplus
 }
 #endif
-
 #endif
