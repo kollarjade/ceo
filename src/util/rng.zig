@@ -57,14 +57,28 @@ pub const DeterministicRng = struct {
     pub fn intRange(self: *Self, comptime T: type, min: T, max: T) T {
         std.debug.assert(min <= max);
         const info = @typeInfo(T);
-        if (info == .Int) {
-            const U = std.meta.Int(.unsigned, info.Int.bits);
-            const range: U = @bitCast(max -% min);
-            const range_plus_one: u64 = @as(u64, range) + 1;
-            const raw = self.next();
-            return min +% @as(T, @bitCast(@as(U, @truncate(raw % range_plus_one))));
+        if (info != .Int) unreachable;
+        comptime std.debug.assert(info.Int.bits <= 64);
+
+        const U = std.meta.Int(.unsigned, info.Int.bits);
+        const min_u: U = @bitCast(min);
+        const max_u: U = @bitCast(max);
+        const span: U = max_u -% min_u +% 1;
+
+        if (span == 0) {
+            return @bitCast(@as(U, @truncate(self.next())));
         }
-        unreachable;
+
+        const max_u_value = std.math.maxInt(U);
+        const limit = max_u_value - (max_u_value % span);
+
+        while (true) {
+            const raw: U = @as(U, @truncate(self.next()));
+            if (raw < limit) {
+                const offset = raw % span;
+                return @bitCast(min_u +% offset);
+            }
+        }
     }
 
     pub fn shuffle(self: *Self, comptime T: type, items: []T) void {
@@ -81,7 +95,7 @@ pub const DeterministicRng = struct {
         errdefer allocator.free(rngs);
 
         for (rngs, 0..) |*r, i| {
-            const seed = self.next() ^ @as(u64, i);
+            const seed = self.next() ^ @as(u64, @intCast(i));
             r.* = Self.init(seed);
         }
 
@@ -112,7 +126,7 @@ pub const DistributedRng = struct {
         errdefer allocator.free(streams);
 
         for (streams, 0..) |*stream, i| {
-            const seed = base_rng.next() ^ (@as(u64, rank) *% 0x9e3779b97f4a7c15) ^ (@as(u64, i) *% 0xbf58476d1ce4e5b9);
+            const seed = base_rng.next() ^ (@as(u64, @intCast(rank)) *% 0x9e3779b97f4a7c15) ^ (@as(u64, @intCast(i)) *% 0xbf58476d1ce4e5b9);
             stream.* = DeterministicRng.init(seed);
         }
 
