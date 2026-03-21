@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 set -Eeuo pipefail
 
 fail() {
@@ -6,7 +5,7 @@ fail() {
     exit 1
 }
 
-resolve_path() {
+resolve_dir() {
     local path="$1"
     [[ -d "$path" ]] || fail "Directory not found: $path"
     cd -- "$path" >/dev/null 2>&1 && pwd -P
@@ -22,25 +21,25 @@ find_cuda_lib_dir() {
     )
     local dir
     for dir in "${candidates[@]}"; do
-        [[ -d "$dir" ]] && {
+        if [[ -d "$dir" ]]; then
             printf '%s\n' "$dir"
             return 0
-        }
+        fi
     done
     return 1
 }
 
 require_cuda_library() {
     local stem="$1"
-    local pattern
-    for pattern in \
-        "$CUDA_LIB_DIR/lib${stem}.so" \
-        "$CUDA_LIB_DIR/lib${stem}.so."* \
-        "$CUDA_LIB_DIR/lib${stem}.a"
-    do
-        [[ -e "$pattern" ]] && return 0
-    done
-    fail "Required CUDA library not found in $CUDA_LIB_DIR: lib${stem}"
+    local matches=()
+    shopt -s nullglob
+    matches=(
+        "$CUDA_LIB_DIR"/lib"$stem".so
+        "$CUDA_LIB_DIR"/lib"$stem".so.*
+        "$CUDA_LIB_DIR"/lib"$stem".a
+    )
+    shopt -u nullglob
+    ((${#matches[@]} > 0)) || fail "Required CUDA library not found in $CUDA_LIB_DIR: lib${stem}"
 }
 
 detect_link_flags() {
@@ -75,7 +74,6 @@ build_kernel() {
     tmp_shared="$TEMP_DIR/libcuda_${kernel}.so"
 
     printf 'Building %s.cu...\n' "$kernel"
-
     detect_link_flags "$src"
 
     "$NVCC_BIN" "${COMMON_FLAGS[@]}" -Xcompiler=-fPIC -c -o "$tmp_obj" "$src"
@@ -88,16 +86,16 @@ build_kernel() {
 }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
-ROOT_DIR="$SCRIPT_DIR"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd -P)"
 SRC_DIR="$ROOT_DIR/kernels/cuda"
 BUILD_DIR="$ROOT_DIR/build/cuda"
 INCLUDE_DIR="$SRC_DIR/include"
-
 CUDA_ARCH="${CUDA_ARCH:-sm_100}"
+
 [[ "$CUDA_ARCH" =~ ^sm_[0-9]+[A-Za-z0-9_]*$ ]] || fail "Invalid CUDA_ARCH value: $CUDA_ARCH"
 
 if [[ -n "${CUDA_PATH:-}" ]]; then
-    CUDA_PATH="$(resolve_path "$CUDA_PATH")"
+    CUDA_PATH="$(resolve_dir "$CUDA_PATH")"
 else
     if command -v nvcc >/dev/null 2>&1; then
         NVCC_FROM_PATH="$(command -v nvcc)"
@@ -140,7 +138,7 @@ while IFS= read -r -d '' src; do
     KERNEL_SOURCES+=("$src")
 done < <(find "$SRC_DIR" -maxdepth 1 -type f -name '*.cu' -print0 | sort -z)
 
-((${#KERNEL_SOURCES[@]} > 0)) || fail "No CUDA source files found in: $SRC_DIR"
+((${#KERNEL_SOURCES[@]} > 0)) || fail "No CUDA source files found in $SRC_DIR"
 
 rm -rf -- "$BUILD_DIR"
 mkdir -p -- "$BUILD_DIR"
@@ -152,7 +150,9 @@ cleanup() {
 trap cleanup EXIT
 
 printf 'Building CUDA kernels for %s...\n' "$CUDA_ARCH"
+printf 'ROOT_DIR: %s\n' "$ROOT_DIR"
 printf 'CUDA_PATH: %s\n' "$CUDA_PATH"
+printf 'CUDA_LIB_DIR: %s\n' "$CUDA_LIB_DIR"
 
 for src in "${KERNEL_SOURCES[@]}"; do
     build_kernel "$src"
