@@ -263,7 +263,7 @@ pub const TrainingStats = struct {
     losses: std.ArrayList(f32),
     learning_rates: std.ArrayList(f32),
     grad_norms: std.ArrayList(f32),
-    start_time: i64,
+    start_time_us: i64,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) TrainingStats {
@@ -274,7 +274,7 @@ pub const TrainingStats = struct {
             .losses = std.ArrayList(f32).init(allocator),
             .learning_rates = std.ArrayList(f32).init(allocator),
             .grad_norms = std.ArrayList(f32).init(allocator),
-            .start_time = std.time.timestamp(),
+            .start_time_us = std.time.microTimestamp(),
             .allocator = allocator,
         };
     }
@@ -288,7 +288,7 @@ pub const TrainingStats = struct {
     pub fn record(self: *TrainingStats, loss: f32, lr: f32, grad_norm: f32, tokens: usize) !void {
         self.total_steps += 1;
         self.total_tokens += tokens;
-        self.total_time_us = std.time.timestamp() - self.start_time;
+        self.total_time_us = std.time.microTimestamp() - self.start_time_us;
         try self.losses.append(loss);
         try self.learning_rates.append(lr);
         try self.grad_norms.append(grad_norm);
@@ -297,8 +297,9 @@ pub const TrainingStats = struct {
     pub fn avgLoss(self: *TrainingStats, window: usize) f32 {
         if (self.losses.items.len == 0) return 0.0;
 
-        const start = if (self.losses.items.len > window)
-            self.losses.items.len - window
+        const actual_window = if (window == 0) self.losses.items.len else window;
+        const start = if (self.losses.items.len > actual_window)
+            self.losses.items.len - actual_window
         else
             0;
 
@@ -311,8 +312,8 @@ pub const TrainingStats = struct {
     }
 
     pub fn throughput(self: *TrainingStats) f64 {
-        const elapsed = std.time.timestamp() - self.start_time;
-        if (elapsed <= 0) return 0.0;
-        return @as(f64, @floatFromInt(self.total_tokens)) / @as(f64, @floatFromInt(elapsed));
+        const elapsed_us = std.time.microTimestamp() - self.start_time_us;
+        if (elapsed_us <= 0) return 0.0;
+        return (@as(f64, @floatFromInt(self.total_tokens)) * 1_000_000.0) / @as(f64, @floatFromInt(elapsed_us));
     }
 };
