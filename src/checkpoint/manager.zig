@@ -71,12 +71,7 @@ pub const CheckpointManager = struct {
         checksum: [32]u8,
     };
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        dir: []const u8,
-        max_to_keep: usize,
-        compression: bool,
-    ) !Self {
+    pub fn init(allocator: std.mem.Allocator, dir: []const u8, max_to_keep: usize, compression: bool) !Self {
         try std.fs.cwd().makePath(dir);
         return .{
             .dir = try allocator.dupe(u8, dir),
@@ -117,6 +112,9 @@ pub const CheckpointManager = struct {
         const temp_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir, temp_name });
         defer self.allocator.free(temp_path);
 
+        const backup_path = try std.fmt.allocPrint(self.allocator, "{s}.bak", .{final_path});
+        defer self.allocator.free(backup_path);
+
         try std.fs.cwd().makePath(self.dir);
         std.fs.cwd().deleteTree(temp_path) catch |err| switch (err) {
             error.FileNotFound => {},
@@ -149,23 +147,38 @@ pub const CheckpointManager = struct {
             try rng_file.writeAll(rng);
         }
 
-        std.fs.cwd().deleteTree(final_path) catch |err| switch (err) {
+        std.fs.cwd().deleteTree(backup_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
-        try std.fs.cwd().rename(temp_path, final_path);
+
+        var had_existing = false;
+        std.fs.cwd().rename(final_path, backup_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        had_existing = std.fs.cwd().openDir(backup_path, .{}) catch null != null;
+        if (had_existing) {
+            if (std.fs.cwd().openDir(backup_path, .{})) |dir| dir.close() else |_| had_existing = false;
+        }
+
+        std.fs.cwd().rename(temp_path, final_path) catch |err| {
+            if (had_existing) {
+                std.fs.cwd().rename(backup_path, final_path) catch {};
+            }
+            return err;
+        };
+
+        if (had_existing) {
+            std.fs.cwd().deleteTree(backup_path) catch {};
+        }
 
         try self.cleanupOldCheckpoints();
 
         return final_path;
     }
 
-    pub fn load(
-        self: *Self,
-        checkpoint_path: []const u8,
-        params: []*Tensor,
-        param_names: []const []const u8,
-    ) !CheckpointMetadata {
+    pub fn load(self: *Self, checkpoint_path: []const u8, params: []*Tensor, param_names: []const []const u8) !CheckpointMetadata {
         if (params.len != param_names.len) return error.ParameterNameCountMismatch;
 
         const meta_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ checkpoint_path, metadata_file_name });
@@ -179,12 +192,7 @@ pub const CheckpointManager = struct {
         return metadata;
     }
 
-    pub fn loadFull(
-        self: *Self,
-        checkpoint_path: []const u8,
-        params: []*Tensor,
-        param_names: []const []const u8,
-    ) !LoadedCheckpoint {
+    pub fn loadFull(self: *Self, checkpoint_path: []const u8, params: []*Tensor, param_names: []const []const u8) !LoadedCheckpoint {
         const metadata = try self.load(checkpoint_path, params, param_names);
 
         const optimizer_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ checkpoint_path, optimizer_file_name });
@@ -199,11 +207,38 @@ pub const CheckpointManager = struct {
         const rng_state = try self.readOptionalBytes(rng_path);
         errdefer if (rng_state) |bytes| self.allocator.free(bytes);
 
-        return .{
-            .metadata = metadata,
-            .optimizer_state = optimizer_state,
-            .rng_state = rng_state,
+        return .{ .metadata = metadata, .optimizer_state = optimizer_state, .rng_state = rng_state };
+    }
+
+    fn trimRightZeroes(bytes: []const u8) []const u8 {
+        var end = bytes.len;
+        while (end > 0 and bytes[end - 1] == 0) : (end -= 1) {}
+        return bytes[0..end];
+    }
+
+    fn encodeHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+        const out = try allocator.alloc(u8, bytes.len * 2);
+        _ = std.fmt.bufPrint(out, "{s}", .{std.fmt.fmtSliceHexLower(bytes)}) catch unreachable;
+        return out;
+    }
+
+    fn hexNibble(c: u8) !u8 {
+        return switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => 10 + c - 'a',
+            'A'...'F' => 10 + c - 'A',
+            else => error.InvalidHexCharacter,
         };
+    }
+
+    fn decodeHexInto(hex: []const u8, out: []u8) !void {
+        if (hex.len != out.len * 2) return error.InvalidHexLength;
+        var i: usize = 0;
+        while (i < out.len) : (i += 1) {
+            const hi = try hexNibble(hex[i * 2]);
+            const lo = try hexNibble(hex[i * 2 + 1]);
+            out[i] = (hi << 4) | lo;
+        }
     }
 
     fn writeMetadata(self: *Self, path: []const u8, metadata: CheckpointMetadata) !void {
@@ -233,16 +268,12 @@ pub const CheckpointManager = struct {
         defer file.close();
 
         const stat = try file.stat();
-        const max_size: u64 = 1024 * 1024;
-        if (stat.size > max_size) return error.MetadataTooLarge;
+        if (stat.size > 1024 * 1024) return error.MetadataTooLarge;
 
-        const content = try file.readToEndAlloc(self.allocator, @intCast(max_size));
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
-        var parsed = try std.json.parseFromSlice(MetadataJson, self.allocator, content, .{
-            .ignore_unknown_fields = false,
-            .allocate = .alloc_always,
-        });
+        var parsed = try std.json.parseFromSlice(MetadataJson, self.allocator, content, .{ .ignore_unknown_fields = false, .allocate = .alloc_always });
         defer parsed.deinit();
 
         var metadata: CheckpointMetadata = .{
@@ -258,19 +289,57 @@ pub const CheckpointManager = struct {
 
         if (parsed.value.git_revision.len > metadata.git_revision.len) return error.InvalidGitRevisionLength;
         @memcpy(metadata.git_revision[0..parsed.value.git_revision.len], parsed.value.git_revision);
-
         if (parsed.value.config_hash.len != metadata.config_hash.len * 2) return error.InvalidConfigHashLength;
         try decodeHexInto(parsed.value.config_hash, &metadata.config_hash);
-
         return metadata;
     }
 
-    fn writeTensors(
-        self: *Self,
-        path: []const u8,
-        params: []*Tensor,
-        param_names: []const []const u8,
-    ) !void {
+    fn hostTensorClone(self: *Self, tensor: *Tensor) !*Tensor {
+        if (tensor.device == .cpu) {
+            return try tensor.to(self.allocator, .cpu, 0);
+        }
+        return try tensor.to(self.allocator, .cpu, 0);
+    }
+
+    fn storeTensorFromHost(self: *Self, dst: *Tensor, host: *Tensor) !void {
+        if (dst.device == .cpu) {
+            const src_bytes = host.rawBytes() orelse return error.NullTensorPointer;
+            const dst_bytes = dst.rawMutBytes() orelse return error.NullTensorPointer;
+            if (src_bytes.len != dst_bytes.len) return error.TensorSizeMismatch;
+            @memcpy(dst_bytes, src_bytes);
+            return;
+        }
+
+        if (@hasDecl(Tensor, "copyFrom")) {
+            try dst.copyFrom(host);
+            return;
+        }
+        if (@hasDecl(Tensor, "copy_")) {
+            try dst.copy_(host);
+            return;
+        }
+        if (@hasDecl(Tensor, "assign")) {
+            try dst.assign(host);
+            return;
+        }
+        return error.UnsupportedDevice;
+    }
+
+    fn checksumForBytes(bytes: []const u8) [32]u8 {
+        var checksum: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &checksum, .{});
+        return checksum;
+    }
+
+    fn checksumForTensor(self: *Self, param: *Tensor, size: usize) ![32]u8 {
+        var host = try self.hostTensorClone(param);
+        defer host.deinit();
+        const ptr = host.ptr() orelse return error.NullTensorPointer;
+        const bytes = @as([*]const u8, @ptrCast(ptr))[0..size];
+        return checksumForBytes(bytes);
+    }
+
+    fn writeTensors(self: *Self, path: []const u8, params: []*Tensor, param_names: []const []const u8) !void {
         if (params.len != param_names.len) return error.ParameterNameCountMismatch;
 
         var name_set = std.StringHashMapUnmanaged(void){};
@@ -292,37 +361,20 @@ pub const CheckpointManager = struct {
             const dtype = param.dtype;
             const byte_size_usize = shape.sizeBytes(dtype);
             const byte_size: u64 = @intCast(byte_size_usize);
+            if (byte_size > 0 and param.ptr() == null) return error.NullTensorPointer;
 
-            const ptr_opt = param.ptr();
-            if (byte_size > 0 and ptr_opt == null) return error.NullTensorPointer;
+            const checksum = if (byte_size == 0) std.mem.zeroes([32]u8) else try self.checksumForTensor(param, byte_size_usize);
 
-            const checksum = if (byte_size == 0)
-                std.mem.zeroes([32]u8)
-            else
-                checksumForTensor(param, byte_size_usize);
+            entries[i] = .{ .name = name, .shape = shape.dims[0..shape.ndim], .dtype = dtype, .offset = 0, .size = byte_size, .checksum = checksum };
 
-            entries[i] = .{
-                .name = name,
-                .shape = shape.dims[0..shape.ndim],
-                .dtype = dtype,
-                .offset = 0,
-                .size = byte_size,
-                .checksum = checksum,
-            };
-
-            index_size += @as(u64, 4) + @as(u64, @intCast(name.len));
-            index_size += @as(u64, 4) + @as(u64, @intCast(shape.ndim)) * @as(u64, 8);
-            index_size += @as(u64, 4);
-            index_size += @as(u64, 8);
-            index_size += @as(u64, 8);
-            index_size += @as(u64, 32);
-
+            index_size += 4 + @as(u64, @intCast(name.len));
+            index_size += 4 + @as(u64, @intCast(shape.ndim)) * 8;
+            index_size += 4 + 8 + 8 + 32;
             data_size += byte_size;
         }
 
-        const header_size: u64 = tensors_magic.len + @as(u64, 4) + @as(u64, 4);
+        const header_size: u64 = tensors_magic.len + 4 + 4;
         var running_offset: u64 = header_size + index_size;
-
         for (entries) |*entry| {
             entry.offset = running_offset;
             running_offset += entry.size;
@@ -330,7 +382,6 @@ pub const CheckpointManager = struct {
 
         const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
         defer file.close();
-
         var writer = file.writer();
 
         try writer.writeAll(tensors_magic);
@@ -340,12 +391,8 @@ pub const CheckpointManager = struct {
         for (entries) |entry| {
             try writer.writeInt(u32, @intCast(entry.name.len), .little);
             try writer.writeAll(entry.name);
-
             try writer.writeInt(u32, @intCast(entry.shape.len), .little);
-            for (entry.shape) |dim| {
-                try writer.writeInt(u64, @intCast(dim), .little);
-            }
-
+            for (entry.shape) |dim| try writer.writeInt(u64, @intCast(dim), .little);
             try writer.writeInt(u32, @intFromEnum(entry.dtype), .little);
             try writer.writeInt(u64, entry.offset, .little);
             try writer.writeInt(u64, entry.size, .little);
@@ -355,7 +402,9 @@ pub const CheckpointManager = struct {
         for (params) |param| {
             const size = param.shape.sizeBytes(param.dtype);
             if (size == 0) continue;
-            const ptr = param.ptr() orelse return error.NullTensorPointer;
+            var host = try self.hostTensorClone(param);
+            defer host.deinit();
+            const ptr = host.ptr() orelse return error.NullTensorPointer;
             const bytes = @as([*]const u8, @ptrCast(ptr))[0..size];
             try writer.writeAll(bytes);
         }
@@ -364,12 +413,7 @@ pub const CheckpointManager = struct {
         if (final_position != header_size + index_size + data_size) return error.InvalidTensorFileSize;
     }
 
-    fn readTensors(
-        self: *Self,
-        path: []const u8,
-        params: []*Tensor,
-        param_names: []const []const u8,
-    ) !void {
+    fn readTensors(self: *Self, path: []const u8, params: []*Tensor, param_names: []const []const u8) !void {
         if (params.len != param_names.len) return error.ParameterNameCountMismatch;
 
         const file = try std.fs.cwd().openFile(path, .{});
@@ -385,9 +429,7 @@ pub const CheckpointManager = struct {
         const version = try file.reader().readInt(u32, .little);
         if (version != current_version) return error.UnsupportedVersion;
 
-        const num_tensors_u32 = try file.reader().readInt(u32, .little);
-        const num_tensors: usize = @intCast(num_tensors_u32);
-
+        const num_tensors: usize = @intCast(try file.reader().readInt(u32, .little));
         var entries = try self.allocator.alloc(CheckpointEntry, num_tensors);
         defer {
             for (entries) |entry| {
@@ -401,35 +443,25 @@ pub const CheckpointManager = struct {
         defer entry_map.deinit(self.allocator);
 
         for (entries, 0..) |*entry, i| {
-            const name_len_u32 = try file.reader().readInt(u32, .little);
-            const name_len: usize = @intCast(name_len_u32);
+            const name_len: usize = @intCast(try file.reader().readInt(u32, .little));
             if (name_len == 0) return error.InvalidTensorName;
-
             entry.name = try self.allocator.alloc(u8, name_len);
-            errdefer self.allocator.free(entry.name);
             try file.reader().readNoEof(entry.name);
-
-            const ndim_u32 = try file.reader().readInt(u32, .little);
-            const ndim: usize = @intCast(ndim_u32);
-
+            const ndim: usize = @intCast(try file.reader().readInt(u32, .little));
             entry.shape = try self.allocator.alloc(usize, ndim);
-            errdefer self.allocator.free(entry.shape);
-
             for (entry.shape) |*dim| {
                 const raw_dim = try file.reader().readInt(u64, .little);
                 dim.* = try std.math.cast(usize, raw_dim) orelse return error.DimensionTooLarge;
             }
-
             const dtype_raw = try file.reader().readInt(u32, .little);
             entry.dtype = std.meta.intToEnum(tensor_mod.DType, dtype_raw) catch return error.InvalidDType;
-
             entry.offset = try file.reader().readInt(u64, .little);
             entry.size = try file.reader().readInt(u64, .little);
             try file.reader().readNoEof(&entry.checksum);
 
             if (entry.offset > file_size) return error.InvalidTensorOffset;
             if (entry.size > file_size) return error.InvalidTensorSize;
-            if (entry.offset + entry.size > file_size) return error.InvalidTensorRange;
+            if (entry.offset > file_size - entry.size) return error.InvalidTensorRange;
 
             const gop = try entry_map.getOrPut(self.allocator, entry.name);
             if (gop.found_existing) return error.DuplicateTensorName;
@@ -442,7 +474,6 @@ pub const CheckpointManager = struct {
             const entry = entries[index];
 
             if (param.dtype != entry.dtype) return error.TensorDTypeMismatch;
-
             const param_shape = param.shape.dims[0..param.shape.ndim];
             if (param_shape.len != entry.shape.len) return error.TensorShapeMismatch;
             for (param_shape, entry.shape) |expected, actual| {
@@ -451,22 +482,22 @@ pub const CheckpointManager = struct {
 
             const expected_size = param.shape.sizeBytes(param.dtype);
             if (entry.size != expected_size) return error.TensorSizeMismatch;
-
             if (expected_size == 0) continue;
-            const ptr = param.ptr() orelse return error.NullTensorPointer;
-            const bytes = @as([*]u8, @ptrCast(ptr))[0..expected_size];
+
+            var host = try Tensor.init(self.allocator, param.shape, param.dtype, .cpu, 0);
+            defer host.deinit();
+            const bytes = host.rawMutBytes() orelse return error.NullTensorPointer;
             try file.seekTo(entry.offset);
             try file.reader().readNoEof(bytes);
-
             const actual_checksum = checksumForBytes(bytes);
             if (!std.mem.eql(u8, &actual_checksum, &entry.checksum)) return error.TensorChecksumMismatch;
+            try self.storeTensorFromHost(param, host);
         }
     }
 
     fn writeOptimizerState(self: *Self, path: []const u8, state: []const u8) !void {
         const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
         defer file.close();
-
         var writer = file.writer();
         try writer.writeAll(optimizer_magic);
         try writer.writeInt(u32, current_version, .little);
@@ -485,21 +516,15 @@ pub const CheckpointManager = struct {
         var magic_buf: [optimizer_magic.len]u8 = undefined;
         try file.reader().readNoEof(&magic_buf);
         if (!std.mem.eql(u8, &magic_buf, optimizer_magic)) return error.InvalidOptimizerStateMagic;
-
         const version = try file.reader().readInt(u32, .little);
         if (version != current_version) return error.UnsupportedVersion;
-
-        const size_u64 = try file.reader().readInt(u64, .little);
-        const size = try std.math.cast(usize, size_u64) orelse return error.OptimizerStateTooLarge;
-
+        const size = try std.math.cast(usize, try file.reader().readInt(u64, .little)) orelse return error.OptimizerStateTooLarge;
         const bytes = try self.allocator.alloc(u8, size);
         errdefer self.allocator.free(bytes);
-
         try file.reader().readNoEof(bytes);
         const end_pos = try file.getPos();
         const stat = try file.stat();
         if (end_pos != stat.size) return error.InvalidOptimizerStateSize;
-
         return bytes;
     }
 
@@ -509,7 +534,6 @@ pub const CheckpointManager = struct {
             else => return err,
         };
         defer file.close();
-
         const stat = try file.stat();
         const size = try std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
         const bytes = try self.allocator.alloc(u8, size);
@@ -519,15 +543,10 @@ pub const CheckpointManager = struct {
     }
 
     fn cleanupOldCheckpoints(self: *Self) !void {
-        if (self.max_to_keep == 0) return;
-
         var dir = try std.fs.cwd().openDir(self.dir, .{ .iterate = true });
         defer dir.close();
 
-        var steps = std.ArrayList(struct {
-            name: []u8,
-            step: usize,
-        }).init(self.allocator);
+        var steps = std.ArrayList(struct { name: []u8, step: usize }).init(self.allocator);
         defer {
             for (steps.items) |item| self.allocator.free(item.name);
             steps.deinit();
@@ -537,11 +556,10 @@ pub const CheckpointManager = struct {
         while (try iter.next()) |entry| {
             if (entry.kind != .directory) continue;
             const step = parseStepDirName(entry.name) orelse continue;
-            try steps.append(.{
-                .name = try self.allocator.dupe(u8, entry.name),
-                .step = step,
-            });
+            try steps.append(.{ .name = try self.allocator.dupe(u8, entry.name), .step = step });
         }
+
+        if (steps.items.len == 0) return;
 
         std.sort.pdq(@TypeOf(steps.items[0]), steps.items, {}, struct {
             fn lessThan(_: void, a: @TypeOf(steps.items[0]), b: @TypeOf(steps.items[0])) bool {
@@ -549,9 +567,10 @@ pub const CheckpointManager = struct {
             }
         }.lessThan);
 
-        if (steps.items.len <= self.max_to_keep) return;
+        const keep = self.max_to_keep;
+        if (keep >= steps.items.len) return;
 
-        for (steps.items[self.max_to_keep..]) |item| {
+        for (steps.items[keep..]) |item| {
             const full_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir, item.name });
             defer self.allocator.free(full_path);
             try std.fs.cwd().deleteTree(full_path);
@@ -562,59 +581,13 @@ pub const CheckpointManager = struct {
         if (!std.mem.startsWith(u8, name, "step_")) return null;
         return std.fmt.parseInt(usize, name["step_".len..], 10) catch null;
     }
-
-    fn trimRightZeroes(bytes: []const u8) []const u8 {
-        var end = bytes.len;
-        while (end > 0 and bytes[end - 1] == 0) : (end -= 1) {}
-        return bytes[0..end];
-    }
-
-    fn encodeHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-        const out = try allocator.alloc(u8, bytes.len * 2);
-        _ = std.fmt.bufPrint(out, "{s}", .{std.fmt.fmtSliceHexLower(bytes)}) catch unreachable;
-        return out;
-    }
-
-    fn decodeHexInto(hex: []const u8, out: []u8) !void {
-        if (hex.len != out.len * 2) return error.InvalidHexLength;
-        var i: usize = 0;
-        while (i < out.len) : (i += 1) {
-            const hi = try hexNibble(hex[i * 2]);
-            const lo = try hexNibble(hex[i * 2 + 1]);
-            out[i] = (hi << 4) | lo;
-        }
-    }
-
-    fn hexNibble(c: u8) !u8 {
-        return switch (c) {
-            '0'...'9' => c - '0',
-            'a'...'f' => 10 + c - 'a',
-            'A'...'F' => 10 + c - 'A',
-            else => error.InvalidHexCharacter,
-        };
-    }
-
-    fn checksumForTensor(param: *Tensor, size: usize) [32]u8 {
-        const ptr = param.ptr() orelse unreachable;
-        const bytes = @as([*]const u8, @ptrCast(ptr))[0..size];
-        return checksumForBytes(bytes);
-    }
-
-    fn checksumForBytes(bytes: []const u8) [32]u8 {
-        var checksum: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &checksum, .{});
-        return checksum;
-    }
 };
 
 pub fn listCheckpoints(allocator: std.mem.Allocator, dir_path: []const u8) !void {
     var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
     defer dir.close();
 
-    var items = std.ArrayList(struct {
-        name: []u8,
-        step: usize,
-    }).init(allocator);
+    var items = std.ArrayList(struct { name: []u8, step: usize }).init(allocator);
     defer {
         for (items.items) |item| allocator.free(item.name);
         items.deinit();
@@ -624,10 +597,7 @@ pub fn listCheckpoints(allocator: std.mem.Allocator, dir_path: []const u8) !void
     while (try iter.next()) |entry| {
         if (entry.kind != .directory) continue;
         const step = CheckpointManager.parseStepDirName(entry.name) orelse continue;
-        try items.append(.{
-            .name = try allocator.dupe(u8, entry.name),
-            .step = step,
-        });
+        try items.append(.{ .name = try allocator.dupe(u8, entry.name), .step = step });
     }
 
     std.sort.pdq(@TypeOf(items.items[0]), items.items, {}, struct {
@@ -638,9 +608,7 @@ pub fn listCheckpoints(allocator: std.mem.Allocator, dir_path: []const u8) !void
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("Checkpoints in {s}:\n", .{dir_path});
-    for (items.items) |item| {
-        try stdout.print("  {s}\n", .{item.name});
-    }
+    for (items.items) |item| try stdout.print("  {s}\n", .{item.name});
 }
 
 pub fn validateCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8) !void {
@@ -664,9 +632,7 @@ pub fn validateCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const
     const version = try file.reader().readInt(u32, .little);
     if (version != CheckpointManager.current_version) return error.UnsupportedVersion;
 
-    const num_tensors_u32 = try file.reader().readInt(u32, .little);
-    const num_tensors: usize = @intCast(num_tensors_u32);
-
+    const num_tensors: usize = @intCast(try file.reader().readInt(u32, .little));
     const stat = try file.stat();
     const file_size = stat.size;
 
@@ -682,9 +648,7 @@ pub fn validateCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const
         const ndim = try file.reader().readInt(u32, .little);
         var dims = try allocator.alloc(u64, ndim);
         defer allocator.free(dims);
-        for (dims) |*dim| {
-            dim.* = try file.reader().readInt(u64, .little);
-        }
+        for (dims) |*dim| dim.* = try file.reader().readInt(u64, .little);
 
         const dtype_raw = try file.reader().readInt(u32, .little);
         _ = std.meta.intToEnum(tensor_mod.DType, dtype_raw) catch return error.InvalidDType;
@@ -697,39 +661,30 @@ pub fn validateCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const
 
         if (offset > file_size) return error.InvalidTensorOffset;
         if (size > file_size) return error.InvalidTensorSize;
-        if (offset + size > file_size) return error.InvalidTensorRange;
+        if (offset > file_size - size) return error.InvalidTensorRange;
     }
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("Checkpoint {s} is valid\n", .{checkpoint_path});
 }
 
-pub fn convertCheckpoint(
-    allocator: std.mem.Allocator,
-    input_path: []const u8,
-    output_path: []const u8,
-    format: CheckpointFormat,
-) !void {
+pub fn convertCheckpoint(allocator: std.mem.Allocator, input_path: []const u8, output_path: []const u8, format: CheckpointFormat) !void {
     switch (format) {
         .efla_native => {
             const cwd = std.fs.cwd();
-
             const input_dir = try cwd.openDir(input_path, .{ .iterate = true });
             defer input_dir.close();
-
             cwd.deleteTree(output_path) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => return err,
             };
             try cwd.makePath(output_path);
-
             var iter = input_dir.iterate();
             while (try iter.next()) |entry| {
                 const src = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ input_path, entry.name });
                 defer allocator.free(src);
                 const dst = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_path, entry.name });
                 defer allocator.free(dst);
-
                 switch (entry.kind) {
                     .file => try copyFile(allocator, src, dst),
                     .directory => try copyDirRecursive(allocator, src, dst),
@@ -745,10 +700,8 @@ fn copyFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []cons
     _ = allocator;
     const src = try std.fs.cwd().openFile(src_path, .{});
     defer src.close();
-
     const dst = try std.fs.cwd().createFile(dst_path, .{ .truncate = true });
     defer dst.close();
-
     var buffer: [64 * 1024]u8 = undefined;
     while (true) {
         const read_n = try src.read(&buffer);
@@ -759,18 +712,14 @@ fn copyFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []cons
 
 fn copyDirRecursive(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) !void {
     try std.fs.cwd().makePath(dst_path);
-
     var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
     defer src_dir.close();
-
     var iter = src_dir.iterate();
     while (try iter.next()) |entry| {
         const child_src = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ src_path, entry.name });
         defer allocator.free(child_src);
-
         const child_dst = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dst_path, entry.name });
         defer allocator.free(child_dst);
-
         switch (entry.kind) {
             .file => try copyFile(allocator, child_src, child_dst),
             .directory => try copyDirRecursive(allocator, child_src, child_dst),
