@@ -35,6 +35,7 @@ pub const Trainer = struct {
     cached_params: ?[]*Tensor,
     cached_grads: ?[]*Tensor,
     cached_param_names: ?[][]const u8,
+    start_time_ms: i64,
 
     const Self = @This();
 
@@ -111,6 +112,7 @@ pub const Trainer = struct {
             .cached_params = params,
             .cached_grads = null,
             .cached_param_names = null,
+            .start_time_ms = std.time.milliTimestamp(),
         };
     }
 
@@ -151,9 +153,14 @@ pub const Trainer = struct {
         );
         defer loader.deinit();
 
-        std.log.info("Created data loader with {d} batches", .{loader.numBatches()});
+        const num_batches = loader.numBatches();
+        if (num_batches == 0) {
+            return error.EmptyDataset;
+        }
 
-        const start_time = std.time.milliTimestamp();
+        std.log.info("Created data loader with {d} batches", .{num_batches});
+
+        self.start_time_ms = std.time.milliTimestamp();
 
         while (self.step < self.config.training.total_steps) {
             if (try loader.next()) |batch| {
@@ -169,7 +176,7 @@ pub const Trainer = struct {
                 }
 
                 if (self.step % self.config.telemetry.metrics_interval == 0) {
-                    const elapsed_ms = std.time.milliTimestamp() - start_time;
+                    const elapsed_ms = std.time.milliTimestamp() - self.start_time_ms;
                     const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
                     const tput = if (elapsed_s > 0.0)
                         @as(f64, @floatFromInt(self.tokens_seen)) / elapsed_s
@@ -208,9 +215,10 @@ pub const Trainer = struct {
 
         self.scheduler.step();
 
-        const now = std.time.timestamp();
-        const elapsed_s = if (self.step > 0)
-            @as(f64, @floatFromInt(self.tokens_seen)) / @as(f64, @floatFromInt(now))
+        const now = std.time.milliTimestamp();
+        const elapsed_ms = now - self.start_time_ms;
+        const throughput = if (elapsed_ms > 0)
+            (@as(f64, @floatFromInt(self.tokens_seen)) * 1000.0) / @as(f64, @floatFromInt(elapsed_ms))
         else
             0.0;
 
@@ -220,10 +228,10 @@ pub const Trainer = struct {
             .loss = loss,
             .lr = lr,
             .grad_norm = grad_norm,
-            .throughput = elapsed_s,
+            .throughput = throughput,
             .memory_used = 0,
             .memory_total = 0,
-            .timestamp = now,
+            .timestamp = std.time.timestamp(),
         });
 
         return loss;
@@ -280,6 +288,18 @@ pub const Trainer = struct {
         self.epoch = metadata.epoch;
         self.tokens_seen = metadata.tokens_seen;
         self.best_loss = metadata.loss;
+        self.scheduler = optim_mod.LRScheduler.init(
+            self.config.training.learning_rate,
+            self.config.training.min_learning_rate,
+            self.config.training.warmup_steps,
+            self.config.training.total_steps,
+            .linear_warmup_cosine,
+        );
+        var i: usize = 0;
+        while (i < self.step) : (i += 1) {
+            self.scheduler.step();
+        }
+        self.start_time_ms = std.time.milliTimestamp();
 
         std.log.info("Resumed from step {d}, epoch {d}", .{ self.step, self.epoch });
     }
