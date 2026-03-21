@@ -49,10 +49,12 @@ extern "C" titan_status_t titan_gelu_forward(
     const float* input, float* output, int n,
     titan_stream_t stream
 ) {
-    if (!input || !output || n <= 0) return TITAN_ERROR_INVALID_ARGUMENT;
+    if (!input || !output || n <= 0) {
+        return TITAN_ERROR_INVALID_ARGUMENT;
+    }
 
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
 
     gelu_forward_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(input, output, n);
 
@@ -63,10 +65,12 @@ extern "C" titan_status_t titan_gelu_backward(
     const float* input, const float* grad_output, float* grad_input, int n,
     titan_stream_t stream
 ) {
-    if (!input || !grad_output || !grad_input || n <= 0) return TITAN_ERROR_INVALID_ARGUMENT;
+    if (!input || !grad_output || !grad_input || n <= 0) {
+        return TITAN_ERROR_INVALID_ARGUMENT;
+    }
 
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
 
     gelu_backward_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
         input, grad_output, grad_input, n
@@ -79,10 +83,12 @@ extern "C" titan_status_t titan_silu_forward(
     const float* input, float* output, int n,
     titan_stream_t stream
 ) {
-    if (!input || !output || n <= 0) return TITAN_ERROR_INVALID_ARGUMENT;
+    if (!input || !output || n <= 0) {
+        return TITAN_ERROR_INVALID_ARGUMENT;
+    }
 
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
 
     silu_forward_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(input, output, n);
 
